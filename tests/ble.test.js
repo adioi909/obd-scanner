@@ -73,14 +73,14 @@ test('hung startNotifications poisons the link -> disconnect, wait, reconnect, r
   const { fake, t, logs } = await setup({ hangStartNotificationsOnce: [U.fff1] }, null, true);
   let lost = 0; t.onDisconnect = () => { lost++; };
   await t.connect();
-  assert.deepEqual(ids(t.subscribed), ['fff1']);
+  assert.deepEqual(ids(t.subscribed), ['ffea'], 'after fff1 hangs, the next attempt tries ffea first');
   assert.equal(t.stats.recoveries, 1);
   assert.equal(fake.stats.connects, 2);
   assert.ok(fake.stats.disconnects >= 1);
   assert.equal(fake.stats.concurrentRejections, 0, 'must not issue ops into the poisoned link');
   assert.equal(lost, 0, 'our own disconnect during recovery must not look like link loss');
   assert.ok(logs.some(l => /HUNG/.test(l)));
-  assert.ok(logs.some(l => /Recovery 1\/2/.test(l)) && logs.some(l => /Recovery 1 OK/.test(l)));
+  assert.ok(logs.some(l => /Recovery 1\/3/.test(l)) && logs.some(l => /Recovery 1 OK/.test(l)));
 });
 
 test('a real (unexpected) disconnect still reports link loss', async () => {
@@ -120,13 +120,13 @@ test('hung writeWithoutResponse -> reconnect -> writeWithResponse used from then
   assert.equal(logs.filter(l => /Write mode is now/.test(l)).length, 1);
 });
 
-test('unrecoverable link: after 2 reconnects the transport goes fatal, session dies, init aborts without spamming commands', async () => {
+test('unrecoverable link: after 3 reconnects the transport goes fatal, session dies, init aborts without spamming commands', async () => {
   const { fake, t, logs } = await setup({ alwaysHangWrites: true });
   await t.connect();
   const s = new ElmSession(t, { timeout: 500 });
   const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
   await assert.rejects(obd.init('0'), (e) => e.fatal === true && /reconnect attempts did not fix/.test(e.message));
-  assert.equal(t.stats.recoveries, 2);
+  assert.equal(t.stats.recoveries, 3);
   assert.equal(s.dead, true);
   assert.ok(txCmds(logs).length <= 2, 'commands sent into dead link: ' + txCmds(logs).join(','));
   await assert.rejects(s.send('ATI'), (e) => e.fatal === true);
@@ -198,9 +198,72 @@ test('verbose logging covers subscribe, TX bytes and RX hex+ascii', async () => 
   const s = new ElmSession(t, { timeout: 500 });
   await s.send('ATI');
   const j = logs.join('\n');
-  assert.match(j, /GATT startNotifications fff1 \(notify, try 1\/2\) \.\.\./);
+  assert.match(j, /GATT startNotifications fff1 \(notify, try 1\/2, timeout \d+ms\) \.\.\./);
   assert.match(j, /GATT startNotifications fff1 .* OK/);
   assert.match(j, /tx: writeWithoutResponse 4 bytes: 41 54 49 0D  'ATI\\r'/);
   assert.match(j, /rx: notify fff1 \d+ bytes: .*'/);
   assert.match(j, /First RX on 0000fff1/);
+});
+
+const FASTPLAN = { notifyTimeout: 40, reconnectWait: 10 };
+
+test('v1.3: fff1 startNotifications always hangs, ffea works -> reconnect rotates to ffea first and init succeeds', async () => {
+  const U = createFakeGattDongle().U;
+  const { fake, t, logs } = await setup({ hangStartNotificationsAlways: [U.fff1], respondOn: U.ffea, mock: { latency: 2 } }, FASTPLAN);
+  await t.connect();
+  assert.equal(t.stats.recoveries, 1);
+  assert.deepEqual(ids(t.subscribed), ['ffea']);
+  const iHang = logs.findIndex(l => /startNotifications fff1 .*HUNG/.test(l));
+  const iOk = logs.findIndex(l => /startNotifications ffea .* OK/.test(l));
+  assert.ok(iHang >= 0 && iOk > iHang, 'fff1 hung first, then ffea succeeded');
+  assert.ok(logs.some(l => /Plan: rotated: ffea first, longer timeout, notify timeout 80ms/.test(l)), 'timeout doubled on attempt 2');
+  assert.ok(logs.some(l => /possible pairing prompt - check phone/.test(l)));
+  const s = new ElmSession(t, { timeout: 400 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+  assert.equal(shortUuid(t.activeNotifyUuid), 'ffea');
+  assert.equal(fake.stats.concurrentRejections, 0);
+});
+
+test('v1.3: notify only works after a first write -> 4th attempt is write-first (listener, ATZ write, then startNotifications)', async () => {
+  const onStatus = [];
+  const { fake, t, logs } = await setup({ notifyOnlyAfterWrite: true, mock: { latency: 2 } }, Object.assign({ onStatus: (m) => onStatus.push(m) }, FASTPLAN));
+  await t.connect();
+  assert.equal(t.stats.recoveries, 3);
+  assert.deepEqual(ids(t.subscribed), ['fff1']);
+  assert.ok(logs.some(l => /Write-first: listeners attached; writing ATZ before startNotifications/.test(l)));
+  const iW = logs.findIndex(l => /write-first ATZ/.test(l));
+  const iS = logs.findIndex((l, i) => i > iW && /startNotifications fff1 .* OK/.test(l));
+  assert.ok(iW >= 0 && iS > iW, 'write happens before the successful startNotifications');
+  assert.equal(fake.stats.concurrentRejections, 0);
+  assert.ok(onStatus.some(m => /possible pairing prompt - check phone/.test(m)), 'UI status mentions pairing prompt');
+  const s = new ElmSession(t, { timeout: 400 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+});
+
+test('v1.3: every startNotifications hangs -> 3 reconnects, then a fatal error with troubleshooting advice', async () => {
+  const { fake, t } = await setup({ hangAllStartNotifications: true }, FASTPLAN);
+  await assert.rejects(t.connect(), (e) => e.fatal === true && /3 reconnect attempts/.test(e.message) && /force-stop other OBD apps/.test(e.message) && /unpair "OBDII"/.test(e.message) && /Forget and re-pick/.test(e.message));
+  assert.equal(t.stats.recoveries, 3);
+  assert.equal(fake.stats.concurrentRejections, 0);
+});
+
+test('v1.3: diagnostics log full properties, descriptors (CCCD), blocklisted getDescriptor and the no-read-property note', async () => {
+  const { t, logs } = await setup({});
+  await t.connect();
+  const j = logs.join('\n');
+  assert.match(j, /props fff1: broadcast=\S+ read=false writeWithoutResponse=false write=false notify=true indicate=false/);
+  assert.match(j, /descriptors on fff1: 00002902-0000-1000-8000-00805f9b34fb -> CCCD 2902 present/);
+  assert.match(j, /getDescriptor\(0x2902\) on fff1: SecurityError .*blocklist/);
+  assert.match(j, /fff1 has no read property; skipping readValue/);
+});
+
+test('v1.3: forget() forgets the device', async () => {
+  const { fake, t } = await setup({});
+  let forgot = 0; fake.device.forget = async () => { forgot++; };
+  assert.equal(await t.forget(), 1);
+  assert.equal(forgot, 1);
 });

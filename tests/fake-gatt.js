@@ -9,7 +9,7 @@ function createFakeGattDongle(opts) {
   const stats = { concurrentRejections: 0, fakeBusy: 0, connects: 0, disconnects: 0, startNotif: [], writes: [] };
   const discListeners = [];
   const once = { hang: {}, fail: {} };
-  let busy = false, busyWrites = opts.busyOnWrites || 0;
+  let busy = false, busyWrites = opts.busyOnWrites || 0, writtenSinceConnect = false;
   const elm = new MockTransport(Object.assign({ latency: 0 }, opts.mock || {}));
   if (opts.silent) elm.write = async function () {};
   let writeBuf = [];
@@ -36,10 +36,16 @@ function createFakeGattDongle(opts) {
         return op('startNotifications', () => {
           stats.startNotif.push(uuid);
           if ((opts.hangStartNotificationsOnce || []).includes(uuid) && !once.hang[uuid]) { once.hang[uuid] = true; return { hang: true }; }
+          if ((opts.hangStartNotificationsAlways || []).includes(uuid)) return { hang: true };
+          if (opts.hangAllStartNotifications) return { hang: true };
+          if (opts.notifyOnlyAfterWrite && !writtenSinceConnect) return { hang: true };
           if ((opts.failFirstStartNotifications || []).includes(uuid) && !once.fail[uuid]) { once.fail[uuid] = true; return { error: 'GATT operation failed for unknown reason.' }; }
           c._notifying = true; return { value: c };
         });
       },
+      getDescriptors() { return op('getDescriptors', () => ({ value: [{ uuid: '00002902-0000-1000-8000-00805f9b34fb' }] })); },
+      getDescriptor() { const e = new Error('getDescriptor(): requested descriptor is blocklisted'); e.name = 'SecurityError'; return Promise.reject(e); },
+      readValue() { return op('readValue', () => ({ value: new DataView(new Uint8Array([1, 2]).buffer) })); },
       stopNotifications() { return op('stopNotifications', () => { c._notifying = false; return { value: c }; }); },
       writeValueWithoutResponse(chunk) { return write(chunk, 'without'); },
       writeValueWithResponse(chunk) { return write(chunk, 'with'); },
@@ -59,6 +65,7 @@ function createFakeGattDongle(opts) {
       if (opts.hangWithoutResponse && mode === 'without') return { hang: true };
       if (busyWrites > 0) { busyWrites--; return { fakeBusy: true }; }
       const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      writtenSinceConnect = true;
       stats.writes.push(mode + ':' + Buffer.from(u8).toString('latin1').replace(/\r/g, '\\r'));
       if (mode === 'without' && opts.dropWithoutResponse) return { value: undefined };
       for (const b of u8) writeBuf.push(b);
@@ -80,10 +87,10 @@ function createFakeGattDongle(opts) {
     name: 'OBDII', id: 'fake',
     gatt: {
       connected: false,
-      connect() { stats.connects++; device.gatt.connected = true; return new Promise(r => setTimeout(() => r(server), delay)); },
+      connect() { stats.connects++; device.gatt.connected = true; writtenSinceConnect = false; return new Promise(r => setTimeout(() => r(server), delay)); },
       disconnect() {
         if (!device.gatt.connected) return;
-        device.gatt.connected = false; busy = false; stats.disconnects++;
+        device.gatt.connected = false; busy = false; writtenSinceConnect = false; stats.disconnects++;
         [ffea, fff1].forEach(c => { c._notifying = false; });
         setTimeout(() => discListeners.forEach(fn => fn()), 0);
       }

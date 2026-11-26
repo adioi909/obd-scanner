@@ -1,8 +1,11 @@
-# OBD Scanner (v1.2)
+# OBD Scanner (v1.3)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
+
+## v1.3 stuck-subscribe handling
+Some dongles hang `startNotifications` (the CCCD write, which can also trigger bonding). v1.3 rotates strategies across up to 3 reconnects: (0) fff1 first, 5s; (1) **ffea first**, 10s; (2) fff1 first, 15s; (3) **write-first**: attach listeners, write `ATZ`, then startNotifications. The UI status says "possible pairing prompt - check phone" while it waits. Before each subscribe it logs full characteristic properties, descriptors (is there a CCCD 2902?) and readValue if the characteristic is readable. "Forget and re-pick device" (Connect tab) drops the browser's saved device permission so the picker starts clean.
 
 ## v1.2 Bluetooth reliability (Android GATT rules)
 Android allows exactly **one** outstanding GATT operation per device. v1.1 subscribed to two notify characteristics in parallel, which made one fail instantly and the other hang, and the hung op then blocked every later write. v1.2:
