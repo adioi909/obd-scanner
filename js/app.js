@@ -1,6 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
+  var APP_VERSION = 'v1.1';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -95,7 +96,7 @@
     } catch (e) {
       log('warn', 'Connect failed: ' + (e && e.message));
       setStatus('err', e && e.name === 'NotFoundError' ? 'Disconnected' : 'Connect failed');
-      if (!(e && e.name === 'NotFoundError')) toast('Connect failed: ' + (e && e.message));
+      if (!(e && e.name === 'NotFoundError')) toast('Connect failed: ' + (e && e.message), 4000);
       return;
     }
     state.transport = t;
@@ -103,9 +104,16 @@
     state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout });
     state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse });
     state.connected = true;
-    $('#i-ble').textContent = t.kind === 'mock' ? 'Simulated' : (t.name + ' · ' + (t.profileName || ''));
+    var bleLabel = t.kind === 'mock' ? 'Simulated' : (t.name + ' · ' + (t.profileName || '') + (t.subscribed && t.subscribed.length ? ' · ntf ' + t.subscribed.map(function (c) { return Transport.shortUuid(c.uuid); }).join('+') : ''));
+    $('#i-ble').textContent = bleLabel;
     $('#btn-disconnect').classList.remove('hidden'); $('#btn-reinit').classList.remove('hidden');
-    await initElm();
+    try {
+      await initElm();
+    } catch (e) {
+      log('warn', 'Init failed: ' + (e && e.message));
+      setStatus('err', 'Init failed');
+      toast('Init failed: ' + (e && e.message) + '. Copy the Console log.', 5000);
+    }
   }
 
   async function initElm() {
@@ -113,8 +121,14 @@
     setStatus('busy', 'Initializing ELM…');
     var info = await o.init(settings.protocol);
     $('#i-elm').textContent = info.elm || '--';
-    $('#i-proto').textContent = info.ecuOk ? info.protocol : ('No ECU response (' + (info.ecuError || '?') + ')');
     $('#i-volt').textContent = info.voltage || '--';
+    if (!info.adapterOk) {
+      $('#i-proto').textContent = 'No adapter response';
+      setStatus('err', 'No adapter response');
+      toast('Dongle did not answer. Open Console, Copy log, and send it.', 5000);
+      return;
+    }
+    $('#i-proto').textContent = info.ecuOk ? info.protocol : ('No ECU response (' + (info.ecuError || '?') + ')');
     if (!info.ecuOk) {
       setStatus('err', 'Adapter OK, no ECU');
       toast('Adapter answered but the car did not. Key on? Try protocol ATSP6.', 4000);
@@ -128,8 +142,9 @@
     state.vin = vin; $('#i-vin').textContent = vin || 'not reported';
     var mon = await o.readMonitor();
     $('#i-mil').textContent = mon ? ((mon.mil ? 'MIL ON' : 'MIL off') + ' · ' + mon.count + ' stored') : '--';
-    setStatus('on', (state.transport.kind === 'mock' ? 'Demo · ' : '') + (state.transport.name || 'Connected'));
-    log('info', 'Init complete');
+    var ntf = state.transport.activeNotifyUuid ? (' · RX ' + Transport.shortUuid(state.transport.activeNotifyUuid)) : '';
+    setStatus('on', (state.transport.kind === 'mock' ? 'Demo · ' : '') + (state.transport.name || 'Connected') + ntf);
+    log('info', 'Init complete' + (state.transport.activeNotifyUuid ? ' (RX on ' + state.transport.activeNotifyUuid + ', ' + (state.transport.writeModeLabel ? state.transport.writeModeLabel() : '') + ')' : ''));
     renderTiles();
   }
 
@@ -483,7 +498,7 @@
   $('#con-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#con-send').click(); });
   $('#con-clear').onclick = function () { logLines = []; scheduleConsole(); };
   $('#con-copy').onclick = async function () {
-    var txt = 'OBD Scanner log ' + new Date().toISOString() + '\nUA: ' + navigator.userAgent + '\n' + logLines.map(function (l) { return l.line; }).join('\n');
+    var txt = 'OBD Scanner ' + APP_VERSION + ' log ' + new Date().toISOString() + '\nUA: ' + navigator.userAgent + '\n' + logLines.map(function (l) { return l.line; }).join('\n');
     try { await navigator.clipboard.writeText(txt); toast('Log copied'); } catch (e) {
       var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' })); a.download = 'obd-log.txt'; a.click(); toast('Log downloaded');
     }
@@ -495,7 +510,8 @@
 
   window.addEventListener('beforeunload', function (e) { if (state.recording) { flush(); e.preventDefault(); e.returnValue = ''; } });
   bindSettings(); renderProfileSelect(); renderTiles();
-  log('info', 'App loaded. Web Bluetooth ' + (Transport.BleTransport.isSupported() ? 'available' : 'NOT available'));
+  if ($('#app-ver')) $('#app-ver').textContent = APP_VERSION;
+  log('info', 'App loaded ' + APP_VERSION + '. Web Bluetooth ' + (Transport.BleTransport.isSupported() ? 'available' : 'NOT available'));
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(function () {});
-  window.__app = { state: state, connect: connect, settings: settings };
+  window.__app = { state: state, connect: connect, settings: settings, version: APP_VERSION };
 })();

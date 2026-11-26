@@ -18,13 +18,60 @@
   ];
   var OPTIONAL_SERVICES = BLE_PROFILES.map(function (p) { return p.service; });
 
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  /** Reject if `promise` does not settle within ms. The original work is not cancelled. */
+  function withTimeout(promise, ms, label) {
+    var timedOut = false;
+    return new Promise(function (resolve, reject) {
+      var t = setTimeout(function () {
+        timedOut = true;
+        reject(new Error((label || 'operation') + ' timed out after ' + ms + 'ms'));
+      }, ms);
+      Promise.resolve(promise).then(
+        function (v) { clearTimeout(t); if (!timedOut) resolve(v); },
+        function (e) { clearTimeout(t); if (!timedOut) reject(e); }
+      );
+    });
+  }
+
+  function shortUuid(u) {
+    u = String(u || '').toLowerCase();
+    if (u.indexOf('0000') === 0 && u.indexOf('-0000-1000-8000-00805f9b34fb') > 0) return u.slice(4, 8);
+    return u.slice(0, 8);
+  }
+
+  function bytesToHex(u8) {
+    var s = [];
+    for (var i = 0; i < u8.length; i++) s.push((u8[i] < 16 ? '0' : '') + u8[i].toString(16).toUpperCase());
+    return s.join(' ');
+  }
+
+  function bytesToAscii(u8) {
+    var out = '';
+    for (var i = 0; i < u8.length; i++) {
+      var c = u8[i];
+      out += c === 13 ? '\\r' : c === 10 ? '\\n' : (c >= 32 && c < 127 ? String.fromCharCode(c) : '.');
+    }
+    return out;
+  }
+
+  function formatBytes(u8) {
+    return u8.length + ' bytes: ' + bytesToHex(u8) + "  '" + bytesToAscii(u8) + "'";
+  }
+
+
   // ---------------- Web Bluetooth transport ----------------
   function BleTransport(opts) {
     this.opts = opts || {};
-    this.device = null; this.server = null; this.notifyChar = null; this.writeChar = null;
+    this.device = null; this.server = null; this.writeChar = null;
+    this.notifyChars = []; this.subscribed = [];
+    this.activeNotifyUuid = null;
     this.onData = function () {}; this.onDisconnect = function () {}; this.log = this.opts.log || function () {};
     this.decoder = typeof TextDecoder !== 'undefined' ? new TextDecoder('ascii') : null;
     this.kind = 'ble';
+    this.writeModeLocked = this.opts.writeMode === 'with' || this.opts.writeMode === 'without';
+    this.useWithoutResponse = this.opts.writeMode !== 'with';
   }
 
   BleTransport.isSupported = function () { return typeof navigator !== 'undefined' && !!navigator.bluetooth; };
@@ -45,26 +92,113 @@
   BleTransport.prototype.connect = async function () {
     var self = this;
     if (!this.device) throw new Error('No device selected');
-    this.log('info', 'Connecting GATT to ' + this.name + ' (' + this.device.id + ')');
-    this.server = await this.device.gatt.connect();
+    this.log('info', 'Connecting GATT to ' + this.name + ' (' + (this.device.id || '') + ')');
+    this.server = await withTimeout(this.device.gatt.connect(), this.opts.gattTimeout || 15000, 'GATT connect');
     var services = await this.server.getPrimaryServices();
     this.log('info', 'Services visible: ' + services.map(function (s) { return s.uuid; }).join(', '));
     var found = await this._pickCharacteristics(services);
     if (!found) throw new Error('No notify+write characteristic pair found. Check Console for the service list.');
-    this.notifyChar = found.notify; this.writeChar = found.write; this.profileName = found.label;
+    this.writeChar = found.write;
+    this.notifyChars = found.notifyList && found.notifyList.length ? found.notifyList : [found.notify];
+    this.profileName = found.label;
     var wp = this.writeChar.properties;
     var mode = this.opts.writeMode || 'auto';
-    this.useWithoutResponse = mode === 'without' ? true : mode === 'with' ? false : (!wp.write && wp.writeWithoutResponse);
-    if (mode === 'auto' && wp.write && wp.writeWithoutResponse) this.useWithoutResponse = true;
-    this.log('info', 'Using ' + found.label + ' notify=' + this.notifyChar.uuid + ' write=' + this.writeChar.uuid + ' (' + (this.useWithoutResponse ? 'writeWithoutResponse' : 'write') + ')');
-    this.notifyChar.addEventListener('characteristicvaluechanged', function (ev) {
-      var dv = ev.target.value;
-      var bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
-      var s = self.decoder ? self.decoder.decode(bytes) : String.fromCharCode.apply(null, bytes);
-      self.onData(s);
-    });
-    await this.notifyChar.startNotifications();
+    if (mode === 'without') this.useWithoutResponse = true;
+    else if (mode === 'with') this.useWithoutResponse = false;
+    else this.useWithoutResponse = !wp.write || !!wp.writeWithoutResponse; // auto: prefer without when available
+    this.log('info', 'Using ' + found.label + ' write=' + this.writeChar.uuid + ' (' + this.writeModeLabel() + ')' +
+      ' notify=[' + this.notifyChars.map(function (c) { return shortUuid(c.uuid); }).join(', ') + ']');
+    this.log('info', 'Write properties: write=' + !!wp.write + ' writeWithoutResponse=' + !!wp.writeWithoutResponse);
+
+    var notifyTimeout = this.opts.notifyTimeout || 5000;
+    this.subscribed = [];
+    this.log('info', 'Starting notifications on ' + this.notifyChars.length + ' characteristic(s), timeout ' + notifyTimeout + 'ms each (in parallel)');
+    var results = await Promise.all(this.notifyChars.map(function (c) { return self._subscribe(c, notifyTimeout); }));
+    var ok = results.filter(Boolean).length;
+    this.log('info', 'Notifications active on ' + ok + '/' + this.notifyChars.length + ' characteristic(s)' +
+      (this.subscribed.length ? ': ' + this.subscribed.map(function (c) { return shortUuid(c.uuid); }).join(', ') : ''));
+    if (!ok) this.log('warn', 'startNotifications did not succeed on any characteristic; writes will still be attempted');
+
+    var delay = this.opts.postSubscribeDelay != null ? this.opts.postSubscribeDelay : 300;
+    if (delay) {
+      this.log('info', 'Waiting ' + delay + 'ms after subscribe before first write');
+      await sleep(delay);
+    }
+    this.log('info', 'BLE link ready for ELM commands');
     return true;
+  };
+
+  BleTransport.prototype._subscribe = async function (char, timeoutMs) {
+    var self = this;
+    var id = shortUuid(char.uuid);
+    var kind = char.properties.notify ? 'notify' : (char.properties.indicate ? 'indicate' : 'unknown');
+    this.log('info', 'startNotifications ' + kind + ' ' + char.uuid + ' ...');
+    char.addEventListener('characteristicvaluechanged', function (ev) { self._onNotify(char, ev); });
+    try {
+      await withTimeout(char.startNotifications(), timeoutMs, 'startNotifications ' + id);
+      this.subscribed.push(char);
+      this.log('info', 'startNotifications ' + id + ' OK');
+      return true;
+    } catch (e) {
+      this.log('warn', 'startNotifications ' + id + ' FAILED: ' + e.message);
+      return false;
+    }
+  };
+
+  BleTransport.prototype._onNotify = function (char, ev) {
+    var dv = ev.target.value;
+    var bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+    var id = shortUuid(char.uuid);
+    if (!this.activeNotifyUuid) {
+      this.activeNotifyUuid = char.uuid;
+      this.notifyChar = char;
+      this.log('info', 'First RX on ' + char.uuid + ' (remembered)');
+    }
+    this.log('rx', 'notify ' + id + ' ' + formatBytes(bytes));
+    var s = this.decoder ? this.decoder.decode(bytes) : String.fromCharCode.apply(null, bytes);
+    this.onData(s);
+  };
+
+  BleTransport.prototype.writeModeLabel = function () {
+    return this.useWithoutResponse ? 'writeWithoutResponse' : 'writeWithResponse';
+  };
+
+  BleTransport.prototype.canToggleWrite = function () {
+    if (this.writeModeLocked || !this.writeChar) return false;
+    var p = this.writeChar.properties;
+    return !!(p.write && p.writeWithoutResponse);
+  };
+
+  BleTransport.prototype.toggleWriteMode = function () {
+    if (!this.canToggleWrite()) return false;
+    this.useWithoutResponse = !this.useWithoutResponse;
+    this.log('info', 'Switching write mode to ' + this.writeModeLabel());
+    return true;
+  };
+
+  BleTransport.prototype.write = async function (str) {
+    var enc;
+    if (typeof TextEncoder !== 'undefined') enc = new TextEncoder().encode(str);
+    else {
+      enc = new Uint8Array(str.length);
+      for (var k = 0; k < str.length; k++) enc[k] = str.charCodeAt(k) & 0xff;
+    }
+    this.log('tx', this.writeModeLabel() + ' ' + formatBytes(enc));
+    var writeTimeout = this.opts.writeTimeout || 3000;
+    for (var i = 0; i < enc.length; i += 20) {
+      var chunk = enc.slice(i, i + 20);
+      if (enc.length > 20) this.log('tx', '  chunk ' + (i / 20 + 1) + ' ' + formatBytes(chunk));
+      await withTimeout(this._writeChunk(chunk), writeTimeout, 'GATT write (' + this.writeModeLabel() + ')');
+    }
+  };
+
+  BleTransport.prototype._writeChunk = async function (chunk) {
+    var c = this.writeChar;
+    if (this.useWithoutResponse && c.writeValueWithoutResponse) return c.writeValueWithoutResponse(chunk);
+    if (!this.useWithoutResponse && c.writeValueWithResponse) return c.writeValueWithResponse(chunk);
+    if (c.writeValueWithoutResponse && !c.properties.write) return c.writeValueWithoutResponse(chunk);
+    if (c.writeValueWithResponse) return c.writeValueWithResponse(chunk);
+    return c.writeValue(chunk);
   };
 
   BleTransport.prototype._pickCharacteristics = async function (services) {
@@ -74,41 +208,37 @@
       try { chars = await s.getCharacteristics(); } catch (e) { this.log('warn', 'getCharacteristics failed on ' + s.uuid + ': ' + e.message); }
       chars.forEach(function (c) {
         var p = c.properties;
-        this.log('info', '  ' + s.uuid.slice(0, 8) + ' / ' + c.uuid + ' [' + ['read', 'write', 'writeWithoutResponse', 'notify', 'indicate'].filter(function (k) { return p[k]; }).join(',') + ']');
+        this.log('info', '  ' + shortUuid(s.uuid) + ' / ' + c.uuid + ' [' + ['read', 'write', 'writeWithoutResponse', 'notify', 'indicate'].filter(function (k) { return p[k]; }).join(',') + ']');
       }, this);
       all.push({ service: s, chars: chars });
     }
-    // 1) known profile with its preferred characteristics
+    function notifies(chars) { return chars.filter(function (c) { return c.properties.notify || c.properties.indicate; }); }
+    function writers(chars) { return chars.filter(function (c) { return c.properties.write || c.properties.writeWithoutResponse; }); }
+    // 1) known profile with its preferred write characteristic; subscribe to ALL notifies in that service
     for (var k = 0; k < BLE_PROFILES.length; k++) {
       var prof = BLE_PROFILES[k];
       var entry = all.filter(function (e) { return e.service.uuid === prof.service; })[0];
       if (!entry) continue;
-      var n = entry.chars.filter(function (c) { return c.uuid === prof.notify && (c.properties.notify || c.properties.indicate); })[0];
-      var w = entry.chars.filter(function (c) { return c.uuid === prof.write && (c.properties.write || c.properties.writeWithoutResponse); })[0];
-      if (n && w) return { notify: n, write: w, label: prof.name };
+      var ns = notifies(entry.chars);
+      var w = entry.chars.filter(function (c) { return c.uuid === prof.write && (c.properties.write || c.properties.writeWithoutResponse); })[0] || writers(entry.chars)[0];
+      var preferred = ns.filter(function (c) { return c.uuid === prof.notify; })[0];
+      if (w && ns.length) return { notify: preferred || ns[0], write: w, notifyList: ns, label: prof.name };
     }
     // 2) any service with a notify + a write characteristic
     for (var j = 0; j < all.length; j++) {
-      var ns = all[j].chars.filter(function (c) { return c.properties.notify || c.properties.indicate; });
-      var ws = all[j].chars.filter(function (c) { return c.properties.write || c.properties.writeWithoutResponse; });
-      if (ns.length && ws.length) return { notify: ns[0], write: ws[0], label: 'auto ' + all[j].service.uuid.slice(0, 8) };
+      var ns2 = notifies(all[j].chars);
+      var ws = writers(all[j].chars);
+      if (ns2.length && ws.length) return { notify: ns2[0], write: ws[0], notifyList: ns2, label: 'auto ' + shortUuid(all[j].service.uuid) };
     }
     return null;
   };
 
-  BleTransport.prototype.write = async function (str) {
-    var enc = new TextEncoder().encode(str);
-    for (var i = 0; i < enc.length; i += 20) {
-      var chunk = enc.slice(i, i + 20);
-      if (this.useWithoutResponse && this.writeChar.writeValueWithoutResponse) await this.writeChar.writeValueWithoutResponse(chunk);
-      else if (this.writeChar.writeValueWithResponse) await this.writeChar.writeValueWithResponse(chunk);
-      else await this.writeChar.writeValue(chunk);
-    }
-  };
-
   BleTransport.prototype.disconnect = async function () {
-    try { if (this.notifyChar) await this.notifyChar.stopNotifications(); } catch (e) { /* ignore */ }
-    if (this.device && this.device.gatt.connected) this.device.gatt.disconnect();
+    var list = this.subscribed.length ? this.subscribed : this.notifyChars;
+    for (var i = 0; i < list.length; i++) {
+      try { await list[i].stopNotifications(); } catch (e) { /* ignore */ }
+    }
+    if (this.device && this.device.gatt && this.device.gatt.connected) this.device.gatt.disconnect();
   };
 
   // ---------------- Mock ELM327 (simulated car) ----------------
@@ -281,29 +411,61 @@
     this.t = transport; this.opts = opts || {};
     this.log = this.opts.log || function () {};
     this.buffer = ''; this.pending = null; this.queue = []; this.busy = false;
+    this.writeProven = false; this.gotRx = false;
     var self = this;
     transport.onData = function (s) { self._onData(s); };
   }
 
   ElmSession.prototype._onData = function (s) {
+    this.gotRx = true;
     this.log('rx', s);
     this.buffer += s;
     if (this.pending && this.buffer.indexOf('>') >= 0) {
       var text = this.buffer.slice(0, this.buffer.lastIndexOf('>'));
       this.buffer = this.buffer.slice(this.buffer.lastIndexOf('>') + 1);
       var p = this.pending; this.pending = null;
-      clearTimeout(p.timer);
+      if (p.timer) clearTimeout(p.timer);
       p.resolve(text);
     }
   };
 
   /** Send a command; resolves with the raw response text (without '>'). Commands are strictly serialized. */
-  ElmSession.prototype.send = function (cmd, timeoutMs) {
+  ElmSession.prototype.send = function (cmd, timeoutMs, sendOpts) {
     var self = this;
     return new Promise(function (resolve, reject) {
-      self.queue.push({ cmd: cmd, timeout: timeoutMs || self.opts.timeout || 2500, resolve: resolve, reject: reject });
+      self.queue.push({ cmd: cmd, timeout: timeoutMs || self.opts.timeout || 2500, probe: !sendOpts || sendOpts.probe !== false, resolve: resolve, reject: reject });
       self._pump();
     });
+  };
+
+  ElmSession.prototype._waitForPrompt = function (ms) {
+    var self = this;
+    return new Promise(function (resolve) {
+      if (self.pending && self.pending.timer) clearTimeout(self.pending.timer);
+      var finished = false;
+      var done = function (result) {
+        if (finished) return;
+        finished = true;
+        if (self.pending) { self.pending = null; }
+        resolve(result);
+      };
+      self.pending = {
+        resolve: function (text) { done({ ok: true, text: text }); },
+        timer: setTimeout(function () { done({ ok: false, text: self.buffer }); }, ms)
+      };
+    });
+  };
+
+  ElmSession.prototype._writeCmd = async function (cmd) {
+    var label = cmd === '' ? '(bare CR)' : cmd;
+    this.log('tx', label);
+    try {
+      await withTimeout(this.t.write(cmd + '\r'), this.opts.writeTimeout || 3000, 'write ' + label);
+      return true;
+    } catch (e) {
+      this.log('warn', 'Write failed (' + (this.t.writeModeLabel ? this.t.writeModeLabel() : 'write') + '): ' + e.message);
+      return false;
+    }
   };
 
   ElmSession.prototype._pump = async function () {
@@ -311,28 +473,35 @@
     this.busy = true;
     var job = this.queue.shift();
     var self = this;
-    if (this.afterTimeout) { this.afterTimeout = false; await new Promise(function (r) { setTimeout(r, 150); }); } // let a late reply drain
-    this.buffer = '';
-    var started = Date.now();
-    var done = new Promise(function (res) {
-      self.pending = {
-        resolve: function (text) { res({ ok: true, text: text }); },
-        timer: setTimeout(function () { self.pending = null; res({ ok: false, text: self.buffer }); }, job.timeout)
-      };
-    });
-    try {
-      this.log('tx', job.cmd);
-      await this.t.write(job.cmd + '\r');
-    } catch (e) {
-      clearTimeout(this.pending && this.pending.timer); this.pending = null;
-      this.busy = false; job.reject(e); this._pump(); return;
+    if (this.afterTimeout) { this.afterTimeout = false; await sleep(150); }
+    var probeMs = this.opts.writeProbeMs != null ? this.opts.writeProbeMs : 2000;
+    var canToggle = !this.writeProven && this.t && typeof this.t.toggleWriteMode === 'function' && this.t.canToggleWrite && this.t.canToggleWrite();
+
+    async function attempt(waitMs) {
+      self.buffer = '';
+      var wrote = await self._writeCmd(job.cmd);
+      if (!wrote) return { ok: false, text: self.buffer, writeFailed: true };
+      return self._waitForPrompt(waitMs);
     }
-    var r = await done;
+
+    var started = Date.now();
+    var waitFirst = (canToggle && job.probe !== false) ? Math.min(probeMs, job.timeout) : job.timeout;
+    var r = await attempt(waitFirst);
+
+    if (!r.ok && canToggle && this.t.toggleWriteMode()) {
+      this.log('info', 'No RX after ' + waitFirst + 'ms for ' + (job.cmd || '(bare CR)') + '; retrying with other write mode');
+      r = await attempt(job.timeout);
+    }
+
+    if (this.pending && this.pending.timer) clearTimeout(this.pending.timer);
+    this.pending = null;
     this.lastLatency = Date.now() - started;
     this.busy = false;
-    if (r.ok) job.resolve(r.text);
-    else {
-      this.log('warn', 'Timeout after ' + job.timeout + 'ms for ' + job.cmd + (r.text ? ' (partial: ' + JSON.stringify(r.text) + ')' : ''));
+    if (r.ok) {
+      this.writeProven = true;
+      job.resolve(r.text);
+    } else {
+      this.log('warn', 'Timeout after ' + this.lastLatency + 'ms for ' + (job.cmd || '(bare CR)') + (r.text ? ' (partial: ' + JSON.stringify(r.text) + ')' : ''));
       this.afterTimeout = true;
       var err = new Error('TIMEOUT'); err.partial = r.text; job.reject(err);
     }
@@ -341,9 +510,97 @@
 
   ElmSession.prototype.clearQueue = function () {
     var q = this.queue; this.queue = [];
+    if (this.pending && this.pending.timer) clearTimeout(this.pending.timer);
+    this.pending = null;
     q.forEach(function (j) { j.reject(new Error('CANCELLED')); });
   };
 
-  var api = { BleTransport: BleTransport, MockTransport: MockTransport, ElmSession: ElmSession, BLE_PROFILES: BLE_PROFILES, OPTIONAL_SERVICES: OPTIONAL_SERVICES };
+
+  // ---------------- Fake GATT dongle (unit tests) ----------------
+  function createFakeGattDongle(opts) {
+    opts = opts || {};
+    var FFF0 = uuid16('fff0'), FFEA = uuid16('ffea'), FFF1 = uuid16('fff1'), FFF2 = uuid16('fff2');
+    var respondOn = (opts.respondOn || FFEA).toLowerCase();
+    var dropWithout = opts.dropWithoutResponse !== false;
+    var hangOn = {};
+    (opts.startNotificationsHangOn || []).forEach(function (u) { hangOn[u.toLowerCase()] = true; });
+    var failOn = {};
+    (opts.startNotificationsFailOn || []).forEach(function (u) { failOn[u.toLowerCase()] = true; });
+    var elm = opts.elm || new MockTransport(Object.assign({ latency: 0 }, opts.mock || {}));
+    elm.onData = function () {};
+    var writeBuf = [];
+
+    function makeChar(uuid, props) {
+      var c = {
+        uuid: uuid,
+        properties: { read: !!props.read, write: !!props.write, writeWithoutResponse: !!props.writeWithoutResponse, notify: !!props.notify, indicate: !!props.indicate },
+        _listeners: [],
+        _notifying: false,
+        addEventListener: function (ev, fn) { if (ev === 'characteristicvaluechanged') c._listeners.push(fn); },
+        startNotifications: function () {
+          if (hangOn[uuid]) return new Promise(function () { /* never settles */ });
+          if (failOn[uuid]) return Promise.reject(new Error('startNotifications rejected'));
+          c._notifying = true;
+          return Promise.resolve(c);
+        },
+        stopNotifications: function () { c._notifying = false; return Promise.resolve(); },
+        writeValueWithoutResponse: function (chunk) { return onWrite(chunk, 'without'); },
+        writeValueWithResponse: function (chunk) { return onWrite(chunk, 'with'); },
+        writeValue: function (chunk) { return onWrite(chunk, 'with'); },
+        _emit: function (str) {
+          var enc = new TextEncoder().encode(str);
+          var ev = { target: { value: new DataView(enc.buffer, enc.byteOffset, enc.byteLength) } };
+          c._listeners.forEach(function (fn) { fn(ev); });
+        }
+      };
+      return c;
+    }
+
+    function onWrite(chunk, mode) {
+      var u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      if (mode === 'without' && dropWithout) return Promise.resolve();
+      for (var i = 0; i < u8.length; i++) writeBuf.push(u8[i]);
+      var text = String.fromCharCode.apply(null, writeBuf);
+      if (text.indexOf('\r') < 0 && text.indexOf('\n') < 0) return Promise.resolve();
+      writeBuf = [];
+      // Deliver the ELM reply on the chosen notify characteristic only.
+      return new Promise(function (resolve) {
+        elm.write(text).then(function () { resolve(); });
+      });
+    }
+
+    var ffea = makeChar(FFEA, { notify: true });
+    var fff1 = makeChar(FFF1, { notify: true });
+    var fff2 = makeChar(FFF2, { write: !opts.withoutOnly, writeWithoutResponse: !opts.withOnly });
+    if (opts.withOnly) { fff2.properties.write = true; fff2.properties.writeWithoutResponse = false; }
+    if (opts.withoutOnly) { fff2.properties.write = false; fff2.properties.writeWithoutResponse = true; }
+    var byUuid = {};
+    byUuid[FFEA] = ffea; byUuid[FFF1] = fff1; byUuid[FFF2] = fff2;
+
+    elm.onData = function (s) {
+      var target = byUuid[respondOn] || ffea;
+      if (target._notifying || target._listeners.length) target._emit(s);
+    };
+
+    var service = {
+      uuid: FFF0,
+      getCharacteristics: function () { return Promise.resolve([ffea, fff1, fff2]); }
+    };
+    var server = { getPrimaryServices: function () { return Promise.resolve([service]); }, connected: true };
+    var device = {
+      name: opts.name || 'OBDII',
+      id: opts.id || 'fake-dongle',
+      gatt: {
+        connected: true,
+        connect: function () { device.gatt.connected = true; return Promise.resolve(server); },
+        disconnect: function () { device.gatt.connected = false; }
+      },
+      addEventListener: function () {}
+    };
+    return { device: device, server: server, service: service, chars: { ffea: ffea, fff1: fff1, fff2: fff2 }, elm: elm };
+  }
+
+  var api = { BleTransport: BleTransport, MockTransport: MockTransport, ElmSession: ElmSession, BLE_PROFILES: BLE_PROFILES, OPTIONAL_SERVICES: OPTIONAL_SERVICES, withTimeout: withTimeout, formatBytes: formatBytes, createFakeGattDongle: createFakeGattDongle, shortUuid: shortUuid };
+
   if (isNode) module.exports = api; else root.Transport = api;
 })(this);
