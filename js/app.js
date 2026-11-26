@@ -2,7 +2,7 @@
 (function () {
   'use strict';
   var $ = function (s) { return document.querySelector(s); };
-  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&', '<': '<', '>': '>', '"': '"', "'": '&#39;' }[c]; }); };
+  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
   var settings = Store.loadSettings();
   var profiles = Store.loadProfiles();
