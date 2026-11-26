@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.1';
+  var APP_VERSION = 'v1.2';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -65,17 +65,17 @@
   function bindSettings() {
     $('#s-units').value = settings.units; $('#s-proto').value = settings.protocol;
     $('#s-multi').checked = settings.multiPid; $('#s-fast').checked = settings.fastResponse;
-    $('#s-write').value = settings.writeMode; $('#s-timeout').value = settings.timeout;
+    $('#s-write').value = settings.writeMode; $('#s-notify').value = settings.notifyChar || 'auto'; $('#s-timeout').value = settings.timeout;
     var save = function () {
       settings.units = $('#s-units').value; settings.protocol = $('#s-proto').value;
       settings.multiPid = $('#s-multi').checked; settings.fastResponse = $('#s-fast').checked;
-      settings.writeMode = $('#s-write').value; settings.timeout = Math.max(500, +$('#s-timeout').value || 2500);
+      settings.writeMode = $('#s-write').value; settings.notifyChar = $('#s-notify').value; settings.timeout = Math.max(500, +$('#s-timeout').value || 2500);
       Store.saveSettings(settings);
       if (state.obd) { state.obd.multiPid = settings.multiPid; state.obd.fastResponse = settings.fastResponse; }
       if (state.session) state.session.opts.timeout = settings.timeout;
       renderTiles();
     };
-    ['#s-units', '#s-proto', '#s-multi', '#s-fast', '#s-write', '#s-timeout'].forEach(function (id) { $(id).addEventListener('change', save); });
+    ['#s-units', '#s-proto', '#s-multi', '#s-fast', '#s-write', '#s-notify', '#s-timeout'].forEach(function (id) { $(id).addEventListener('change', save); });
   }
 
   // ---------------- Connect ----------------
@@ -88,7 +88,7 @@
       if (kind === 'mock') t = new Transport.MockTransport({ log: log });
       else {
         if (!Transport.BleTransport.isSupported()) { toast('Web Bluetooth not available here. Use Chrome on Android.'); return; }
-        t = new Transport.BleTransport({ log: log, writeMode: settings.writeMode });
+        t = new Transport.BleTransport({ log: log, writeMode: settings.writeMode, notifyChar: settings.notifyChar, onStatus: function (m) { setStatus('busy', m); } });
         await t.request(acceptAll); // must run directly from the click gesture
       }
       setStatus('busy', 'Connecting…');
@@ -111,8 +111,8 @@
       await initElm();
     } catch (e) {
       log('warn', 'Init failed: ' + (e && e.message));
-      setStatus('err', 'Init failed');
-      toast('Init failed: ' + (e && e.message) + '. Copy the Console log.', 5000);
+      setStatus('err', e && e.fatal ? 'Bluetooth link failed' : 'Init failed');
+      toast((e && e.fatal ? 'Bluetooth link failed: ' : 'Init failed: ') + (e && e.message) + ' Copy the Console log.', 6000);
     }
   }
 

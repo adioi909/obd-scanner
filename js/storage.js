@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   var LS_SETTINGS = 'obd.settings.v1', LS_PROFILES = 'obd.profiles.v1';
-  var DEFAULT_SETTINGS = { units: 'imperial', protocol: '0', multiPid: true, fastResponse: true, writeMode: 'auto', timeout: 2500, activeProfile: 'preset-quick' };
+  var DEFAULT_SETTINGS = { units: 'imperial', protocol: '0', multiPid: true, fastResponse: true, writeMode: 'auto', notifyChar: 'auto', timeout: 2500, activeProfile: 'preset-quick' };
 
   function loadSettings() {
     try { return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}')); } catch (e) { return Object.assign({}, DEFAULT_SETTINGS); }

@@ -21,60 +21,65 @@
     this.isCan = false;
   }
 
-  Obd.prototype.cmd = function (c, t, sendOpts) { return this.s.send(c, t, sendOpts); };
+  Obd.prototype.cmd = function (c, t) { return this.s.send(c, t); };
 
   /** ELM init sequence. protocol: '0' auto or '6' etc. Returns info object.
-   *  Never throws: a single command timeout will not abort the rest of init. */
+   *  A single command timeout never aborts init, but a dead link (e.fatal) does, and if the adapter
+   *  never answers at all we stop instead of spamming the remaining commands into a dead link. */
   Obd.prototype.init = async function (protocol) {
     var info = { adapterOk: false, ecuOk: false };
     var self = this;
     function identFrom(raw, sent) {
       return (ELM.cleanLines(raw, sent).filter(function (l) { return /ELM|V\d/.test(l); })[0] || '').trim();
     }
-    async function at(c, t, sendOpts) {
+    async function at(c, t) {
       var label = c === '' ? '(bare CR)' : c;
       try {
-        var r = await self.cmd(c, t, sendOpts);
-        if (String(r).trim()) info.adapterOk = true;
+        var r = await self.cmd(c, t);
+        info.adapterOk = true; // a prompt came back, so the adapter is alive (even if the text is empty)
         return r;
       } catch (e) {
+        if (e.fatal || self.s.dead) throw e;
         self.log('warn', label + ' failed: ' + e.message);
         if (e.partial && String(e.partial).trim()) info.adapterOk = true;
         return e.partial || '';
       }
     }
+    var T = Object.assign({ wake: 2000, atz: 10000, atws: 8000, ati: 4000, at: 3000, pid: 12000 }, this.opts.initTimeouts || {});
 
-    var T = Object.assign({ wake: 2000, atz: 10000, atws: 8000, atd: 4000, ati: 4000, at: 3000, pid: 12000 }, this.opts.initTimeouts || {});
-    self.log('info', 'Init: waking adapter with a bare CR (also probes write mode)');
-    await at('', T.wake); // probes writeWithoutResponse then writeWithResponse if no RX
-
+    self.log('info', 'Init: bare CR to wake the adapter');
+    await at('', T.wake);
     self.log('info', 'Init: ATZ (up to ' + T.atz + 'ms; clones can be slow or silent)');
-    var z = await at('ATZ', T.atz, { probe: false });
+    var z = await at('ATZ', T.atz);
     info.elm = identFrom(z, 'ATZ');
+
+    // Adapter silent: one deliberate change per step (reserve notify characteristic, then write mode), never per command.
+    var steps = 0, tr = self.s.t;
+    while (!info.adapterOk && tr && typeof tr.nextFallback === 'function' && steps < 3) {
+      steps++;
+      var fb = await tr.nextFallback();
+      if (!fb) break;
+      self.log('info', 'Init: no RX yet, fallback ' + steps + ': ' + fb);
+      await at('', T.wake);
+      z = await at('ATZ', T.atz);
+      info.elm = identFrom(z, 'ATZ') || info.elm;
+    }
+    if (!info.adapterOk) {
+      self.log('warn', 'Init: adapter never answered; stopping here instead of sending the rest of the init into a silent link');
+      this.info = info;
+      return info;
+    }
     if (!info.elm) {
-      self.log('info', 'Init: ATZ did not identify the adapter; trying ATWS, then ATD + ATI');
-      var ws = await at('ATWS', T.atws, { probe: false });
-      info.elm = identFrom(ws, 'ATWS');
-      if (!info.elm) await at('ATD', T.atd, { probe: false });
-      var ident = await at('ATI', T.ati, { probe: false });
-      info.elm = identFrom(ident, 'ATI') || identFrom(z, 'ATZ') || (ident || z || '').trim();
-      // If still nothing and the other write mode has not been tried, flip and retry ATZ once.
-      if (!info.adapterOk && self.s.t && self.s.t.canToggleWrite && self.s.t.canToggleWrite() && self.s.t.toggleWriteMode()) {
-        self.log('info', 'Init: no adapter RX yet; retrying ATZ with the other write mode');
-        z = await at('ATZ', T.atz, { probe: false });
-        info.elm = identFrom(z, 'ATZ') || info.elm;
-      }
+      var ati = await at('ATI', T.ati);
+      info.elm = identFrom(ati, 'ATI');
+      if (!info.elm) { var ws = await at('ATWS', T.atws); info.elm = identFrom(ws, 'ATWS'); }
     }
     self.log('info', 'Init: adapter id = ' + (info.elm || '(unknown)'));
 
-    await at('ATE0', T.at, { probe: false });
-    await at('ATL0', T.at, { probe: false });
-    await at('ATS0', T.at, { probe: false });
-    await at('ATH0', T.at, { probe: false });
-    await at('ATAT1', T.at, { probe: false });
-    await at('ATSP' + (protocol || '0'), T.at, { probe: false });
+    await at('ATE0', T.at); await at('ATL0', T.at); await at('ATS0', T.at); await at('ATH0', T.at); await at('ATAT1', T.at);
+    await at('ATSP' + (protocol || '0'), T.at);
     var r = '';
-    try { r = await this.cmd('0100', T.pid, { probe: false }); if (String(r).trim()) info.adapterOk = true; } catch (e) { r = e.partial || ''; }
+    try { r = await this.cmd('0100', T.pid); } catch (e) { if (e.fatal || self.s.dead) throw e; r = e.partial || ''; }
     var err = ELM.detectError(r, '0100');
     info.ecuOk = !err;
     info.ecuError = err;
@@ -82,16 +87,15 @@
       var msgs = ELM.parsePidResponse(r, 1, PIDS.length);
       this._supportedFirst = msgs['00'] || null;
     }
-    var dpn = (await at('ATDPN', T.at, { probe: false })).replace(/[^0-9A-F]/gi, '').toUpperCase();
+    var dpn = (await at('ATDPN', T.at)).replace(/[^0-9A-F]/gi, '').toUpperCase();
     info.protocolNum = dpn.replace(/^A/, '');
     info.protocol = PROTOCOLS[info.protocolNum] || (dpn ? ('Protocol ' + dpn) : 'unknown');
     this.isCan = /^[6-9AB]$/.test(info.protocolNum);
-    var rv = await at('ATRV', T.at, { probe: false });
+    var rv = await at('ATRV', T.at);
     info.voltage = (ELM.cleanLines(rv, 'ATRV')[0] || '').trim();
     this.info = info;
     return info;
   };
-
 
   /** Query supported PIDs 0100/0120/0140/... -> array of PID hex strings. */
   Obd.prototype.readSupported = async function () {
