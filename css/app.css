@@ -7,6 +7,7 @@ body { padding-bottom:calc(76px + env(safe-area-inset-bottom)); }
 .topbar { position:sticky; top:0; z-index:5; display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#0b0f14; border-bottom:1px solid var(--line); }
 .brand { font-weight:800; font-size:20px; letter-spacing:.5px; color:var(--acc); }
 .brand span { color:var(--text); font-weight:600; margin-left:4px; }
+.brand .ver { color:var(--dim); font-weight:600; font-size:12px; margin-left:8px; letter-spacing:0; }
 .pill { padding:6px 12px; border-radius:999px; font-size:14px; font-weight:600; max-width:60vw; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .pill.off { background:#30363d; color:var(--dim); } .pill.busy { background:#5a4500; color:#ffd36e; } .pill.on { background:#0f3d1e; color:#7ee787; } .pill.err { background:#4a1414; color:#ffa198; }
 main { padding:10px; max-width:900px; margin:0 auto; }

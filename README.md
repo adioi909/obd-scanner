@@ -1,7 +1,18 @@
-# OBD Scanner (v1)
+# OBD Scanner (v1.1)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
+
+
+## v1.1 connect reliability
+Real-hardware logs showed the app hanging at "Connecting..." after picking FFF0 / fff1 / fff2, with no ATZ in the log. This dongle also exposes a second notify characteristic (`ffea`). v1.1:
+
+- Subscribes to **every** notify/indicate characteristic in the service (fff1 and ffea), in parallel, each with a timeout, and accepts RX from whichever fires first.
+- Logs startNotifications start/success/fail, every TX (mode + hex + ascii), every RX (which characteristic, hex + ascii), and timeouts.
+- After subscribing, waits a short beat before the first write.
+- If `writeWithoutResponse` gets no RX within 2s, retries with `writeWithResponse` (and the reverse); remembers the mode that worked. Writes are chunked to 20 bytes and always end in `\r`.
+- Init sends a bare `\r` first, then ATZ with a long timeout; a single timeout no longer aborts connect. ATWS / ATD / ATI are used if ATZ is silent.
+- The status pill always leaves "Connecting..." — "No adapter response", "Connect failed", or "Adapter OK, no ECU".
 
 ## Use
 1. Open the site in Chrome on the phone (it has to be HTTPS for Web Bluetooth). Allow Bluetooth and Nearby devices.
