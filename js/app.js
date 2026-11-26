@@ -1,13 +1,13 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.2';
+  var APP_VERSION = 'v1.3';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
   var settings = Store.loadSettings();
   var profiles = Store.loadProfiles();
-  var state = { transport: null, session: null, obd: null, connected: false, live: false, recording: null, supported: null, vin: null };
+  var state = { lastDevice: null, transport: null, session: null, obd: null, connected: false, live: false, recording: null, supported: null, vin: null };
 
   // ---------------- Console log ----------------
   var LOG_MAX = 1500, logLines = [];
@@ -90,15 +90,19 @@
         if (!Transport.BleTransport.isSupported()) { toast('Web Bluetooth not available here. Use Chrome on Android.'); return; }
         t = new Transport.BleTransport({ log: log, writeMode: settings.writeMode, notifyChar: settings.notifyChar, onStatus: function (m) { setStatus('busy', m); } });
         await t.request(acceptAll); // must run directly from the click gesture
+        state.lastDevice = t.device;
       }
       setStatus('busy', 'Connecting…');
       await t.connect();
     } catch (e) {
       log('warn', 'Connect failed: ' + (e && e.message));
-      setStatus('err', e && e.name === 'NotFoundError' ? 'Disconnected' : 'Connect failed');
-      if (!(e && e.name === 'NotFoundError')) toast('Connect failed: ' + (e && e.message), 4000);
+      var cancelled = e && e.name === 'NotFoundError';
+      setStatus('err', cancelled ? 'Disconnected' : 'Connect failed');
+      if (t && t.disconnect && t.device) { try { await t.disconnect(); } catch (x) { /* ignore */ } }
+      if (!cancelled) { $('#conn-help').classList.remove('hidden'); toast('Connect failed: ' + (e && e.message), 8000); }
       return;
     }
+    $('#conn-help').classList.add('hidden');
     state.transport = t;
     t.onDisconnect = function () { onLinkLost(); };
     state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout });
@@ -171,6 +175,20 @@
   $('#btn-connect-all').onclick = function () { connect('ble', true); };
   $('#btn-mock').onclick = function () { connect('mock'); };
   $('#btn-disconnect').onclick = disconnect;
+  $('#btn-forget').onclick = async function () {
+    await disconnect();
+    var n = 0;
+    try {
+      var ghost = new Transport.BleTransport({ log: log });
+      ghost.device = state.lastDevice;
+      n = await ghost.forget();
+    } catch (e) { log('warn', 'Forget failed: ' + e.message); }
+    state.lastDevice = null;
+    log('info', 'Forgot ' + n + ' saved Bluetooth device permission(s)');
+    $('#i-ble').textContent = '--'; $('#i-elm').textContent = '--'; $('#i-proto').textContent = '--'; $('#i-vin').textContent = '--';
+    setStatus('off', 'Disconnected');
+    toast(n ? 'Forgot ' + n + ' saved device(s). Tap Connect dongle and pick OBDII again.' : 'No saved device to forget here. If OBDII is listed in Android Bluetooth settings, unpair it, then Connect.', 7000);
+  };
   $('#btn-reinit').onclick = function () { if (state.connected) initElm(); };
 
   function requireConn() { if (!state.connected) { toast('Connect the dongle first (or use Demo mode)'); return false; } return true; }

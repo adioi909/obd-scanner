@@ -150,38 +150,58 @@
     }
   };
 
+  var HELP_TEXT = 'Try: force-stop other OBD apps (Car Scanner / Torque, including "work in background"), toggle Bluetooth off and on, ' +
+    'unpair "OBDII" in Android Bluetooth settings if it is listed, then tap "Forget and re-pick device" and connect again.';
+  var CHAR_PROP_KEYS = ['broadcast', 'read', 'writeWithoutResponse', 'write', 'notify', 'indicate', 'authenticatedSignedWrites', 'reliableWrite', 'writableAuxiliaries'];
+
+  /**
+   * Connect plan for attempt n (0 = first try, 1.. = reconnects). Rotates which notify characteristic is tried first,
+   * lengthens the startNotifications timeout (CCCD write may trigger bonding), and finally tries "write-first".
+   * Once a subscription has worked, reconnects keep that characteristic first.
+   */
+  BleTransport.prototype._planFor = function (n) {
+    var T = this._opt('notifyTimeout', 5000);
+    if (this._goodNotifyUuid) return { n: n, rotate: 0, timeout: T * 2, writeFirst: false, pairing: false, name: 'known-good characteristic first' };
+    if (n === 0) return { n: 0, rotate: 0, timeout: T, writeFirst: false, pairing: false, name: 'default order (fff1 first)' };
+    if (n === 1) return { n: 1, rotate: 1, timeout: T * 2, writeFirst: false, pairing: true, name: 'rotated: ffea first, longer timeout' };
+    if (n === 2) return { n: 2, rotate: 0, timeout: T * 3, writeFirst: false, pairing: true, name: 'fff1 first again, longest timeout' };
+    return { n: n, rotate: 0, timeout: T * 2, writeFirst: true, pairing: true, name: 'write-first (ATZ is written before notifications are enabled)' };
+  };
+
   BleTransport.prototype.connect = function () {
     var self = this;
     if (!this.device) return Promise.reject(new Error('No device selected'));
     return this._exclusive(async function () {
+      var max = self._opt('maxRecoveries', 3);
       self.log('info', 'Connecting GATT to ' + self.name + ' (' + (self.device.id || '') + ')');
-      try { await self._setup(); }
+      try { await self._setup(self._planFor(0)); }
       catch (e) {
         if (e.noRecover || e.fatal) throw e;
-        self.log('warn', 'GATT setup failed: ' + e.message + ' -> reconnecting');
-        var ok = await self._recoverLoop(e.message, self._opt('maxRecoveries', 2));
+        self.log('warn', 'GATT setup failed: ' + e.message + ' -> reconnecting (up to ' + max + ' times)');
+        var ok = await self._recoverLoop(e.message, max, 1);
         if (!ok) {
           self._dead = true;
-          throw fatalError('Could not establish a working Bluetooth GATT link after ' + self._opt('maxRecoveries', 2) + ' reconnect attempts (' + (self._lastErr || e.message) + ').', e);
+          throw fatalError('Could not establish a working Bluetooth GATT link after ' + max + ' reconnect attempts (' + (self._lastErr || e.message) + '). ' + HELP_TEXT, e);
         }
       }
       return true;
     });
   };
 
-  /** disconnect -> wait -> connect -> rediscover -> resubscribe. Must be called from inside _exclusive. */
-  BleTransport.prototype._recoverLoop = async function (reason, maxTries) {
+  /** disconnect -> wait -> connect -> rediscover -> resubscribe, each try with the next connect plan. Call inside _exclusive. */
+  BleTransport.prototype._recoverLoop = async function (reason, maxTries, firstPlan) {
     var wait = this._opt('reconnectWait', 1000);
     for (var i = 1; i <= maxTries; i++) {
+      var plan = this._planFor((firstPlan || 1) + i - 1);
       this.stats.recoveries++;
       this._recovering = true; this._expectDisc = true;
       this.onStatus('Reconnecting Bluetooth (' + i + '/' + maxTries + ')…');
-      this.log('warn', 'Recovery ' + i + '/' + maxTries + ' (' + reason + '): disconnect, wait ' + wait + 'ms, reconnect, rediscover');
+      this.log('warn', 'Recovery ' + i + '/' + maxTries + ' (' + reason + '): disconnect, wait ' + wait + 'ms, reconnect, rediscover. Plan: ' + plan.name + ', notify timeout ' + plan.timeout + 'ms');
       try { if (this.device && this.device.gatt) this.device.gatt.disconnect(); } catch (e) { /* ignore */ }
       this._poisoned = false;
       await sleep(wait);
       try {
-        await this._setup();
+        await this._setup(plan);
         this._recovering = false; this._expectDisc = false;
         this.log('info', 'Recovery ' + i + ' OK');
         return true;
@@ -195,8 +215,9 @@
     return false;
   };
 
-  BleTransport.prototype._setup = async function () {
+  BleTransport.prototype._setup = async function (plan) {
     var self = this;
+    plan = plan || this._planFor(0);
     this.subscribed = []; this.altNotify = []; this.notifyChars = []; this.writeChar = null;
     this.server = await this._runOp('gatt.connect', function () { return self.device.gatt.connect(); }, { timeout: this._opt('gattTimeout', 15000) });
     var d1 = this._opt('postConnectDelay', 400);
@@ -207,7 +228,7 @@
     if (!found) { var ne = new Error('No notify+write characteristic pair found. Check Console for the service list.'); ne.noRecover = true; throw ne; }
     this.writeChar = found.write; this.profileName = found.label;
     var list = found.notifyList.slice();
-    // manual notify choice (Settings)
+    if (plan.rotate && list.length > 1) { var r = plan.rotate % list.length; list = list.slice(r).concat(list.slice(0, r)); }
     var want = String(this._opt('notifyChar', 'auto')).toLowerCase();
     this.notifyLocked = false;
     if (want !== 'auto') {
@@ -215,9 +236,9 @@
       if (m) { list = [m]; this.notifyLocked = true; this.log('info', 'Notify characteristic locked to ' + want + ' (Settings)'); }
       else this.log('warn', 'Settings asked for notify ' + want + ' but it is not in this service; using auto');
     }
-    // after a reconnect, prefer the characteristic that already produced RX
-    if (this.activeNotifyUuid) {
-      var act = list.filter(function (c) { return c.uuid === self.activeNotifyUuid; })[0];
+    var first = this.activeNotifyUuid || this._goodNotifyUuid;
+    if (first) {
+      var act = list.filter(function (c) { return c.uuid === first; })[0];
       if (act) list = [act].concat(list.filter(function (c) { return c !== act; }));
     }
     this.notifyChars = list;
@@ -226,40 +247,87 @@
       var mode = this._opt('writeMode', 'auto');
       if (mode === 'without') this.useWithoutResponse = true;
       else if (mode === 'with') this.useWithoutResponse = false;
-      else this.useWithoutResponse = !wp.write || !!wp.writeWithoutResponse; // auto: prefer without
+      else this.useWithoutResponse = !wp.write || !!wp.writeWithoutResponse;
       this._modeChosen = true;
     }
     this.log('info', 'Using ' + found.label + ' write=' + this.writeChar.uuid + ' [' + this.writeModeLabel() + '; write=' + !!wp.write + ' writeWithoutResponse=' + !!wp.writeWithoutResponse + ']' +
-      ' notify order=[' + list.map(function (c) { return shortUuid(c.uuid); }).join(', ') + ']');
-    await this._subscribeSequence(list);
+      ' notify order=[' + list.map(function (c) { return shortUuid(c.uuid); }).join(', ') + '] plan="' + plan.name + '"');
+
+    if (plan.writeFirst) {
+      list.forEach(function (c) { self._attachListener(c); });
+      this.log('info', 'Write-first: listeners attached; writing ATZ before startNotifications (some clones only enable notify after the first write)');
+      try {
+        await this._runOp('write-first ATZ (' + this.writeModeLabel() + ')', function () { return self._writeChunk(new Uint8Array([0x41, 0x54, 0x5A, 0x0D])); }, { timeout: this._opt('writeTimeout', 3000) });
+      } catch (e) { if (e.timeout || e.busy) throw e; this.log('warn', 'Write-first ATZ failed: ' + e.message + ' (continuing)'); }
+      await sleep(this._opt('writeFirstDelay', 500));
+    }
+    await this._subscribeSequence(list, plan);
     var d2 = this._opt('postSubscribeDelay', 300);
     if (d2) { this.log('info', 'Waiting ' + d2 + 'ms after subscribe before first write'); await sleep(d2); }
     this.log('info', 'BLE link ready for ELM commands');
   };
 
-  /** Subscribe SEQUENTIALLY. Primary first (retry once); alternates only if the primary cannot be enabled. */
-  BleTransport.prototype._subscribeSequence = async function (list) {
-    var ok = await this._trySubscribe(list[0], true);
+  /** Subscribe SEQUENTIALLY. Primary first (retry once on a plain failure); alternates only if the primary cannot be enabled. */
+  BleTransport.prototype._subscribeSequence = async function (list, plan) {
+    var ok = await this._trySubscribe(list[0], true, plan);
     var i = 1;
-    while (!ok && i < list.length) { ok = await this._trySubscribe(list[i], false); i++; }
+    while (!ok && i < list.length) { ok = await this._trySubscribe(list[i], false, plan); i++; }
     if (!ok) throw new Error('Could not enable notifications on any characteristic');
     this.altNotify = list.filter(function (c) { return this.subscribed.indexOf(c) < 0; }, this);
     if (this.altNotify.length && !this.notifyLocked)
       this.log('info', 'Alternate notify characteristic(s) held in reserve (used only if no RX arrives): ' + this.altNotify.map(function (c) { return shortUuid(c.uuid); }).join(', '));
   };
 
-  BleTransport.prototype._trySubscribe = async function (char, retry) {
+  BleTransport.prototype._attachListener = function (char) {
+    var self = this;
+    if (char.__obdListening) return;
+    char.__obdListening = true;
+    char.addEventListener('characteristicvaluechanged', function (ev) { self._onNotify(char, ev); });
+  };
+
+  /** Log full properties, descriptors (is there a CCCD 0x2902?) and readValue if allowed. Purely diagnostic. */
+  BleTransport.prototype._diagnose = async function (char) {
+    var self = this, id = shortUuid(char.uuid), p = char.properties || {};
+    this.log('info', '  props ' + id + ': ' + CHAR_PROP_KEYS.map(function (k) { return k + '=' + (p[k] === undefined ? 'n/a' : !!p[k]); }).join(' '));
+    var dt = this._opt('descTimeout', 3000);
+    if (typeof char.getDescriptors === 'function') {
+      try {
+        var ds = await this._runOp('getDescriptors ' + id, function () { return char.getDescriptors(); }, { timeout: dt, quiet: true });
+        var u = (ds || []).map(function (d) { return d.uuid; });
+        this.log('info', '  descriptors on ' + id + ': ' + (u.length ? u.join(', ') : '(none listed)') + (u.some(function (x) { return /^00002902/.test(x); }) ? ' -> CCCD 2902 present' : ' -> no CCCD 2902 listed'));
+      } catch (e) { if (e.timeout || e.busy) throw e; this.log('info', '  getDescriptors ' + id + ' failed: ' + (e.name || '') + ' ' + e.message); }
+    } else this.log('info', '  getDescriptors not supported by this browser');
+    if (typeof char.getDescriptor === 'function') {
+      try {
+        await this._runOp('getDescriptor(0x2902) ' + id, function () { return char.getDescriptor(0x2902); }, { timeout: dt, quiet: true });
+        this.log('info', '  getDescriptor(0x2902) on ' + id + ': OK');
+      } catch (e) { if (e.timeout || e.busy) throw e; this.log('info', '  getDescriptor(0x2902) on ' + id + ': ' + (e.name || '') + ' ' + e.message + ' (Chrome blocklists the CCCD for scripts; startNotifications writes it itself, so this error is normal)'); }
+    }
+    if (p.read && typeof char.readValue === 'function') {
+      try {
+        var dv = await this._runOp('readValue ' + id, function () { return char.readValue(); }, { timeout: dt, quiet: true });
+        var u8 = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+        this.log('info', '  readValue ' + id + ': ' + formatBytes(u8));
+      } catch (e) { if (e.timeout || e.busy) throw e; this.log('info', '  readValue ' + id + ' failed: ' + e.message); }
+    } else this.log('info', '  ' + id + ' has no read property; skipping readValue');
+  };
+
+  BleTransport.prototype._trySubscribe = async function (char, retry, plan) {
     var self = this, id = shortUuid(char.uuid);
     var kind = char.properties.notify ? 'notify' : (char.properties.indicate ? 'indicate' : 'notify');
-    if (!char.__obdListening) {
-      char.__obdListening = true;
-      char.addEventListener('characteristicvaluechanged', function (ev) { self._onNotify(char, ev); });
-    }
+    this._attachListener(char);
+    var timeout = plan ? plan.timeout : this._opt('notifyTimeout', 5000) * 2;
+    if (this.opts.diagnostics !== false) await this._diagnose(char);
     var tries = retry ? 2 : 1;
     for (var n = 1; n <= tries; n++) {
+      if (plan && plan.pairing) {
+        this.onStatus('Enabling notifications on ' + id + '… possible pairing prompt - check phone');
+        this.log('info', 'possible pairing prompt - check phone (waiting up to ' + timeout + 'ms for startNotifications ' + id + ')');
+      }
       try {
-        await this._runOp('startNotifications ' + id + ' (' + kind + ', try ' + n + '/' + tries + ')', function () { return char.startNotifications(); }, { timeout: this._opt('notifyTimeout', 5000) });
+        await this._runOp('startNotifications ' + id + ' (' + kind + ', try ' + n + '/' + tries + ', timeout ' + timeout + 'ms)', function () { return char.startNotifications(); }, { timeout: timeout });
         if (this.subscribed.indexOf(char) < 0) this.subscribed.push(char);
+        if (!this._goodNotifyUuid) this._goodNotifyUuid = char.uuid;
         return true;
       } catch (e) {
         if (e.timeout || e.busy) throw e; // poisoned: do not touch GATT again, let recovery handle it
@@ -267,6 +335,19 @@
       }
     }
     return false;
+  };
+
+  /** Forget the browser's saved permission for this device (and any other saved OBD device). Returns how many were forgotten. */
+  BleTransport.prototype.forget = async function () {
+    var n = 0;
+    try { if (this.device && typeof this.device.forget === 'function') { await this.device.forget(); n++; } } catch (e) { this.log('warn', 'device.forget failed: ' + e.message); }
+    try {
+      if (typeof navigator !== 'undefined' && navigator.bluetooth && typeof navigator.bluetooth.getDevices === 'function') {
+        var ds = await navigator.bluetooth.getDevices();
+        for (var i = 0; i < ds.length; i++) if (ds[i] !== this.device && typeof ds[i].forget === 'function') { await ds[i].forget(); n++; }
+      }
+    } catch (e) { this.log('warn', 'getDevices/forget failed: ' + e.message); }
+    return n;
   };
 
   BleTransport.prototype._onNotify = function (char, ev) {
@@ -341,7 +422,7 @@
     if (typeof TextEncoder !== 'undefined') enc = new TextEncoder().encode(str);
     else { enc = new Uint8Array(str.length); for (var k = 0; k < str.length; k++) enc[k] = str.charCodeAt(k) & 0xff; }
     return this._exclusive(async function () {
-      var maxRec = self._opt('maxRecoveries', 2), attempt = 0;
+      var maxRec = self._opt('maxRecoveries', 3), attempt = 0;
       for (;;) {
         if (self._dead) throw fatalError('Bluetooth link is dead (earlier unrecoverable failure)');
         self.log('tx', self.writeModeLabel() + ' ' + formatBytes(enc));
@@ -360,7 +441,7 @@
           self.log('warn', 'Write failed (' + self.writeModeLabel() + '): ' + e.message);
           if (attempt > maxRec) { self._dead = true; throw fatalError('Bluetooth write failed and ' + maxRec + ' reconnect attempts did not fix it (' + e.message + ').', e); }
           if (!self.rxSeen && !e.busy && self.canToggleWrite()) { self.toggleWriteMode(); self.log('info', 'No RX has ever arrived, so after reconnect the other write mode will be used (once, not per command)'); }
-          await self._recoverLoop(e.message, 1);
+          await self._recoverLoop(e.message, 1, 1);
         }
       }
     });
@@ -374,7 +455,7 @@
     var self = this;
     return this._exclusive(async function () {
       if (self._dead) return null;
-      if (self._poisoned) { try { await self._recoverLoop('poisoned before fallback', 1); } catch (e) { return null; } }
+      if (self._poisoned) { try { await self._recoverLoop('poisoned before fallback', 1, 1); } catch (e) { return null; } }
       if (!self.notifyLocked && self.altNotify.length) {
         var c = self.altNotify.shift();
         try {
