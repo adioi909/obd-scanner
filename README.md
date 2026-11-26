@@ -1,18 +1,18 @@
-# OBD Scanner (v1.1)
+# OBD Scanner (v1.2)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
 
-## v1.1 connect reliability
-Real-hardware logs showed the app hanging at "Connecting..." after picking FFF0 / fff1 / fff2, with no ATZ in the log. This dongle also exposes a second notify characteristic (`ffea`). v1.1:
+## v1.2 Bluetooth reliability (Android GATT rules)
+Android allows exactly **one** outstanding GATT operation per device. v1.1 subscribed to two notify characteristics in parallel, which made one fail instantly and the other hang, and the hung op then blocked every later write. v1.2:
 
-- Subscribes to **every** notify/indicate characteristic in the service (fff1 and ffea), in parallel, each with a timeout, and accepts RX from whichever fires first.
-- Logs startNotifications start/success/fail, every TX (mode + hex + ascii), every RX (which characteristic, hex + ascii), and timeouts.
-- After subscribing, waits a short beat before the first write.
-- If `writeWithoutResponse` gets no RX within 2s, retries with `writeWithResponse` (and the reverse); remembers the mode that worked. Writes are chunked to 20 bytes and always end in `\r`.
-- Init sends a bare `\r` first, then ATZ with a long timeout; a single timeout no longer aborts connect. ATWS / ATD / ATI are used if ATZ is silent.
-- The status pill always leaves "Connecting..." — "No adapter response", "Connect failed", or "Adapter OK, no ECU".
+- **One GATT queue.** Every GATT call (connect, discovery, startNotifications, writes) goes through a single serialized chain with a per-op timeout.
+- **Sequential subscribe.** 400ms after connect, subscribe **fff1 first** (retry once after 500ms on failure). `ffea` is held in reserve and only subscribed if the adapter gives no RX at all, or fff1 cannot be enabled.
+- **Hung op = poisoned link.** A timed-out GATT op is never followed by more GATT calls. The app disconnects, waits 1s, reconnects, rediscovers and resubscribes (max 2 attempts), then retries. If that fails the link is declared dead, the queue is aborted and the status shows "Bluetooth link failed". Init does not spray commands into a dead link.
+- **"Already in progress" = busy.** Wait with backoff (150/300/600/1000/1500 ms) and retry the same op. It is never counted as no-RX and never switches write mode.
+- **Write mode.** Prefers writeWithoutResponse. It switches (once, not per command) only if a write throws/hangs before any RX has ever arrived, after the reconnect, or once during init if the adapter is completely silent.
+- **Settings:** BLE notify characteristic (Auto / fff1 only / ffea only) and write mode (Auto / with response / without response), applied on the next connect.
 
 ## Use
 1. Open the site in Chrome on the phone (it has to be HTTPS for Web Bluetooth). Allow Bluetooth and Nearby devices.
@@ -32,7 +32,7 @@ If live data stalls on a real car, turn off *Multi-PID requests* and *Fast respo
 | `js/elm.js` | Pure ELM327 response parsing: cleans prompt, echo and `SEARCHING...`, detects errors, handles ISO-TP multi-frame (`014` / `0:` `1:`), multi-PID and multi-ECU responses, supported-PID bitmasks, and VIN. |
 | `js/pids.js` | Mode 01 PID library (formulas, units, ranges, categories), imperial/metric conversion, preset profiles. |
 | `js/dtc.js` | DTC decoding for modes 03/07/0A (CAN count byte and legacy padded formats), MIL status, short descriptions. |
-| `js/transport.js` | `BleTransport` (Web Bluetooth: tries the known BLE-serial services FFF0, FFE0, 18F0, E7810A71 (Vlink), Nordic UART, AE30, FF00 and FFB0, then auto-picks any notify+write pair), `MockTransport` (simulated ELM and car), `ElmSession` (serialized command queue that waits for the `>` prompt, with timeouts). |
+| `js/transport.js` | `BleTransport` (Web Bluetooth with the serialized GATT queue and reconnect logic described above; known services FFF0, FFE0, 18F0, E7810A71 (Vlink), Nordic UART, AE30, FF00, FFB0, then any notify+write pair), `MockTransport` (simulated ELM and car), `ElmSession` (serialized command queue that waits for the `>` prompt, with timeouts). |
 | `js/obd.js` | High-level operations: init (`ATZ ATE0 ATL0 ATS0 ATH0 ATAT1 ATSPx 0100 ATDPN ATRV`), supported PIDs, VIN (0902), DTCs, clear (04), batched PID polling with automatic fallback, freeze frame (mode 02). |
 | `js/storage.js` | Settings and profiles in localStorage. Recorded sessions in IndexedDB (`sessions` + `rows`), flushed every 2 s while recording. |
 | `js/chart.js` | Dependency-free canvas line chart. |
@@ -54,7 +54,7 @@ Manufacturer mode 21/22 PIDs would need a new request path in `obd.js`. That isn
 
 ## Tests
 ```
-node --test tests/core.test.js          # parsing, PID formulas, DTCs, queue, full mock-dongle session
+node --test tests/core.test.js tests/ble.test.js   # parsing, PIDs, DTCs, queue, mock dongle, fake Android GATT stack (tests/fake-gatt.js)
 npm i --no-save puppeteer-core && node tests/e2e-mock.js [url]   # headless Chrome run in Demo mode
 ```
 
