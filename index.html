@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<title>OBD Scanner</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon.svg">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">OBD<span>Scanner</span></div>
+  <div id="status" class="pill off" role="status">Disconnected</div>
+</header>
+
+<main>
+  <!-- CONNECT -->
+  <section id="view-connect" class="view active">
+    <div id="bt-warning" class="card warn hidden">
+      Web Bluetooth isn't available in this browser. Open this page in <b>Chrome on Android</b> (HTTPS), with Bluetooth and Location / Nearby devices allowed. Demo mode still works.
+    </div>
+    <div class="card">
+      <h2>Adapter</h2>
+      <div class="btn-col">
+        <button id="btn-connect" class="btn primary big">Connect dongle</button>
+        <button id="btn-connect-all" class="btn big">Show all Bluetooth devices</button>
+        <button id="btn-mock" class="btn big ghost">Demo mode (simulated car)</button>
+        <button id="btn-disconnect" class="btn big danger hidden">Disconnect</button>
+      </div>
+      <p class="hint">Plug the dongle in, key ON (engine running is fine). Pick the device named <b>OBDII</b>. If it doesn't show, use "Show all Bluetooth devices". Close Torque / Car Scanner first: a BLE dongle only talks to one app at a time.</p>
+    </div>
+    <div class="card">
+      <h2>Vehicle</h2>
+      <dl class="kv" id="vehicle-info">
+        <dt>Adapter</dt><dd id="i-elm">--</dd>
+        <dt>BLE link</dt><dd id="i-ble">--</dd>
+        <dt>Protocol</dt><dd id="i-proto">--</dd>
+        <dt>Battery (ATRV)</dt><dd id="i-volt">--</dd>
+        <dt>VIN</dt><dd id="i-vin" class="mono">--</dd>
+        <dt>MIL / codes</dt><dd id="i-mil">--</dd>
+        <dt>Supported PIDs</dt><dd id="i-sup">--</dd>
+      </dl>
+      <button id="btn-reinit" class="btn hidden">Re-run init</button>
+    </div>
+    <div class="card">
+      <h2>Settings</h2>
+      <label class="row">Units
+        <select id="s-units"><option value="imperial">Imperial (°F, mph, psi)</option><option value="metric">Metric (°C, km/h, kPa)</option></select>
+      </label>
+      <label class="row">Protocol
+        <select id="s-proto">
+          <option value="0">Auto (ATSP0)</option>
+          <option value="6">CAN 11-bit 500k (ATSP6)</option>
+          <option value="7">CAN 29-bit 500k (ATSP7)</option>
+          <option value="8">CAN 11-bit 250k (ATSP8)</option>
+          <option value="9">CAN 29-bit 250k (ATSP9)</option>
+          <option value="5">KWP fast (ATSP5)</option>
+          <option value="4">KWP 5-baud (ATSP4)</option>
+          <option value="3">ISO 9141-2 (ATSP3)</option>
+          <option value="2">J1850 VPW (ATSP2)</option>
+          <option value="1">J1850 PWM (ATSP1)</option>
+        </select>
+      </label>
+      <label class="row">Multi-PID requests (faster on CAN)<input type="checkbox" id="s-multi"></label>
+      <label class="row">Fast response (append "1")<input type="checkbox" id="s-fast"></label>
+      <label class="row">BLE write mode
+        <select id="s-write"><option value="auto">Auto</option><option value="without">Without response</option><option value="with">With response</option></select>
+      </label>
+      <label class="row">Command timeout (ms)<input type="number" id="s-timeout" min="500" max="10000" step="100"></label>
+      <p class="hint">If live data stalls or shows "--" on a real car, turn off Multi-PID and Fast response, then reconnect.</p>
+    </div>
+  </section>
+
+  <!-- LIVE -->
+  <section id="view-live" class="view">
+    <div class="card tight">
+      <div class="live-head">
+        <select id="live-profile" class="grow"></select>
+      </div>
+      <div class="btn-row">
+        <button id="btn-live" class="btn primary big grow">Start live</button>
+        <button id="btn-rec" class="btn rec big grow">● Record</button>
+      </div>
+      <div class="stats"><span id="st-rate">0.0 Hz</span><span id="st-samples">0 samples</span><span id="st-time">0:00</span></div>
+    </div>
+    <div id="tiles" class="tiles"></div>
+  </section>
+
+  <!-- CODES -->
+  <section id="view-codes" class="view">
+    <div class="card tight">
+      <div class="btn-row">
+        <button id="btn-read-dtc" class="btn primary big grow">Read codes</button>
+        <button id="btn-freeze" class="btn big grow">Freeze frame</button>
+      </div>
+      <button id="btn-clear-dtc" class="btn danger big full">Clear codes / reset MIL</button>
+      <div id="mil-line" class="mil"></div>
+    </div>
+    <div id="dtc-lists"></div>
+    <div id="freeze" class="card hidden"></div>
+  </section>
+
+  <!-- LOGS -->
+  <section id="view-logs" class="view">
+    <div id="session-detail" class="hidden"></div>
+    <div id="session-list"></div>
+  </section>
+
+  <!-- PROFILES -->
+  <section id="view-profiles" class="view">
+    <div id="profile-list"></div>
+    <div id="profile-editor" class="card hidden"></div>
+  </section>
+
+  <!-- CONSOLE -->
+  <section id="view-console" class="view">
+    <div class="card tight">
+      <div class="btn-row">
+        <input id="con-input" class="grow mono" placeholder="ATI, 010C, 03 ..." autocapitalize="characters" autocomplete="off" spellcheck="false">
+        <button id="con-send" class="btn primary">Send</button>
+      </div>
+      <div class="chips" id="con-quick"></div>
+      <div class="btn-row">
+        <button id="con-copy" class="btn grow">Copy log</button>
+        <button id="con-clear" class="btn grow">Clear</button>
+        <label class="row inline"><input type="checkbox" id="con-rx" checked> Show live traffic</label>
+      </div>
+    </div>
+    <pre id="console" class="console"></pre>
+  </section>
+</main>
+
+<nav class="tabs">
+  <button data-view="connect" class="active"><span class="ic">⚡</span>Connect</button>
+  <button data-view="live"><span class="ic">◔</span>Live</button>
+  <button data-view="codes"><span class="ic">⚠</span>Codes</button>
+  <button data-view="logs"><span class="ic">≋</span>Logs</button>
+  <button data-view="profiles"><span class="ic">☰</span>Profiles</button>
+  <button data-view="console"><span class="ic">›_</span>Console</button>
+</nav>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <h3 id="dlg-title"></h3>
+    <p id="dlg-body"></p>
+    <div class="btn-row">
+      <button value="cancel" class="btn big grow">Cancel</button>
+      <button value="ok" id="dlg-ok" class="btn danger big grow">OK</button>
+    </div>
+  </form>
+</dialog>
+<div id="toast" class="toast"></div>
+
+<script src="js/elm.js"></script>
+<script src="js/pids.js"></script>
+<script src="js/dtc.js"></script>
+<script src="js/transport.js"></script>
+<script src="js/obd.js"></script>
+<script src="js/storage.js"></script>
+<script src="js/chart.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
