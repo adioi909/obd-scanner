@@ -29,7 +29,7 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.goto(url, { waitUntil: 'networkidle0' });
   check(await page.$('#btn-connect') !== null, 'page loads');
   const ver = await page.$eval('#app-ver', e => e.textContent);
-  check(ver === 'v1.6', 'visible version is v1.6, got ' + ver);
+  check(ver === 'v1.6.1', 'visible version is v1.6.1, got ' + ver);
   await page.screenshot({ path: path.join(shots, '1-connect.png') });
 
   await page.click('#btn-mock');
@@ -112,13 +112,20 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.click('#dlg-ok');
   await page.waitForFunction(() => document.querySelectorAll('#dtc-lists .card')[0] && document.querySelectorAll('#dtc-lists .card')[0].textContent.includes('None'), { timeout: 10000 });
   check(true, 'clear codes (with confirm) works');
+  await page.click('#btn-freeze');
+  await page.waitForFunction(() => (document.querySelector('#freeze') || {}).textContent.includes('No freeze frame stored'), { timeout: 15000 });
+  const ff = await page.$eval('#freeze', e => e.textContent);
+  check(ff.includes('only pending codes') || ff.includes('No freeze frame stored'), 'freeze frame empty state: ' + ff.slice(0, 80));
+
+  await page.waitForFunction(() => !document.querySelector('#toast.show'), { timeout: 8000 });
 
   // Profiles
   await page.click('.tabs [data-view=profiles]');
   await page.click('#btn-new-prof');
   await page.type('#pe-name', 'Test profile');
-  await page.click('[data-pid="05"]'); await page.click('[data-pid="5C"]');
-  await page.click('#pe-save');
+  await page.$eval('[data-pid="05"]', el => el.click());
+  await page.$eval('[data-pid="5C"]', el => el.click());
+  await page.$eval('#pe-save', el => el.click());
   const names = await page.$$eval('#profile-list b', els => els.map(e => e.textContent));
   check(names.includes('Test profile'), 'profile created');
   const stored = await page.evaluate(() => JSON.parse(localStorage.getItem('obd.profiles.v1')).find(p => p.name === 'Test profile').pids);

@@ -325,3 +325,16 @@ test('v1.6: mitsubishi mock, single-PID + "1" suffix (as in the v1.5 log): every
   assert.ok(logs.some(l => /Live 010C1 -> /.test(l)));
   assert.ok(logs.some(l => /Live 010D1 -> /.test(l) || /Live 0105 1/.test(l) || /Live 01051 -> /.test(l)));
 });
+
+test('v1.6.1: readFreezeFrame returns null when the ECU has no stored (confirmed) DTC', async () => {
+  const mock = new MockTransport({ latency: 1, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 400 });
+  const obd = new Obd(s, { pidTimeout: 300 });
+  await obd.init('0');
+  await obd.readSupported();
+  const d = await obd.readDtcs();
+  assert.deepEqual(d.stored.codes, []);
+  assert.deepEqual(d.pending.codes, ['P0420']);
+  assert.equal(await obd.readFreezeFrame(), null);
+});
