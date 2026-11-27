@@ -29,7 +29,7 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.goto(url, { waitUntil: 'networkidle0' });
   check(await page.$('#btn-connect') !== null, 'page loads');
   const ver = await page.$eval('#app-ver', e => e.textContent);
-  check(ver === 'v1.4', 'visible version is v1.4, got ' + ver);
+  check(ver === 'v1.5', 'visible version is v1.5, got ' + ver);
   await page.screenshot({ path: path.join(shots, '1-connect.png') });
 
   await page.click('#btn-mock');

@@ -81,8 +81,8 @@ test('hung startNotifications poisons the link -> disconnect, wait, reconnect, r
   assert.equal(fake.stats.concurrentRejections, 0, 'must not issue ops into the poisoned link');
   assert.equal(lost, 0, 'our own disconnect during recovery must not look like link loss');
   assert.ok(logs.some(l => /HUNG/.test(l)));
-  assert.ok(logs.some(l => /Recovery 1\/3/.test(l)) && logs.some(l => /Recovery 1 OK/.test(l)));
-  assert.ok(logs.some(l => /retry only ffea/.test(l)));
+  assert.ok(logs.some(l => /Attempt 2\/10: disconnect, wait/.test(l)) && logs.some(l => /Attempt 2\/10 OK/.test(l)));
+  assert.ok(logs.some(l => /ffea first \(it subscribed before the hang\)/.test(l)));
 });
 
 test('a real (unexpected) disconnect still reports link loss', async () => {
@@ -217,7 +217,7 @@ test('v1.4: fff1 startNotifications always hangs, ffea works -> first attempt su
   const iOk = logs.findIndex(l => /startNotifications ffea .* OK/.test(l));
   const iHang = logs.findIndex(l => /startNotifications fff1 .*HUNG/.test(l));
   assert.ok(iOk >= 0 && iHang > iOk, 'ffea subscribed first, then fff1 hung');
-  assert.ok(logs.some(l => /retry only ffea/.test(l)));
+  assert.ok(logs.some(l => /ffea first \(it subscribed before the hang\)/.test(l)));
   assert.ok(logs.some(l => /possible pairing prompt - check phone/.test(l)));
   const s = new ElmSession(t, { timeout: 400 });
   const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
@@ -227,11 +227,11 @@ test('v1.4: fff1 startNotifications always hangs, ffea works -> first attempt su
   assert.equal(fake.stats.concurrentRejections, 0);
 });
 
-test('v1.3: notify only works after a first write -> 4th attempt is write-first (listener, ATZ write, then startNotifications)', async () => {
+test('v1.5: notify only works after a first write -> the write-first variant (attempt 6) wins (listener, ATZ write, then startNotifications)', async () => {
   const onStatus = [];
   const { fake, t, logs } = await setup({ notifyOnlyAfterWrite: true, mock: { latency: 2 } }, Object.assign({ onStatus: (m) => onStatus.push(m) }, FASTPLAN));
   await t.connect();
-  assert.equal(t.stats.recoveries, 3);
+  assert.equal(t.stats.recoveries, 5, 'five failed attempts, the sixth variant is write-first');
   assert.ok(ids(t.subscribed).includes('ffea') || ids(t.subscribed).includes('fff1'));
   assert.ok(logs.some(l => /Write-first: listeners attached; writing ATZ before startNotifications/.test(l)));
   const iW = logs.findIndex(l => /write-first ATZ/.test(l));
@@ -245,21 +245,22 @@ test('v1.3: notify only works after a first write -> 4th attempt is write-first 
   assert.equal(info.ecuOk, true);
 });
 
-test('v1.3: every startNotifications hangs -> 3 reconnects, then a fatal error with troubleshooting advice', async () => {
-  const { fake, t } = await setup({ hangAllStartNotifications: true }, FASTPLAN);
-  await assert.rejects(t.connect(), (e) => e.fatal === true && /3 reconnect attempts/.test(e.message) && /force-stop other OBD apps/.test(e.message) && /unpair "OBDII"/.test(e.message) && /Forget and re-pick/.test(e.message));
+test('v1.5: every startNotifications hangs -> maxAttempts reconnects, then a fatal error with troubleshooting advice', async () => {
+  const { fake, t } = await setup({ hangAllStartNotifications: true }, Object.assign({ maxAttempts: 4 }, FASTPLAN));
+  await assert.rejects(t.connect(), (e) => e.fatal === true && /after 4 attempts/.test(e.message) && /force-stop other OBD apps/.test(e.message) && /unpair "OBDII"/.test(e.message) && /Forget and re-pick/.test(e.message));
   assert.equal(t.stats.recoveries, 3);
   assert.equal(fake.stats.concurrentRejections, 0);
 });
 
-test('v1.3: diagnostics log full properties, descriptors (CCCD), blocklisted getDescriptor and the no-read-property note', async () => {
-  const { t, logs } = await setup({});
+const DIAG_VARIANT = [{ id: 'ffea-diag-test', order: 'ffea', settle: 0, diag: true, direct: false, writeFirst: false }];
+test('v1.3: diagnostics (when the variant enables them) log full properties, descriptors (CCCD), blocklisted getDescriptor and the no-read-property note', async () => {
+  const { t, logs } = await setup({}, { variantTable: DIAG_VARIANT });
   await t.connect();
   const j = logs.join('\n');
-  assert.match(j, /props fff1: broadcast=\S+ read=false writeWithoutResponse=false write=false notify=true indicate=false/);
-  assert.match(j, /descriptors on fff1: 00002902-0000-1000-8000-00805f9b34fb -> CCCD 2902 present/);
-  assert.match(j, /getDescriptor\(0x2902\) on fff1: SecurityError .*blocklist/);
-  assert.match(j, /fff1 has no read property; skipping readValue/);
+  assert.match(j, /props ffea: broadcast=\S+ read=false writeWithoutResponse=false write=false notify=true indicate=false/);
+  assert.match(j, /descriptors on ffea: 00002902-0000-1000-8000-00805f9b34fb -> CCCD 2902 present/);
+  assert.match(j, /getDescriptor\(0x2902\) on ffea: SecurityError .*blocklist/);
+  assert.match(j, /ffea has no read property; skipping readValue/);
 });
 
 test('v1.3: forget() forgets the device', async () => {
@@ -275,7 +276,7 @@ test('v1.4: fff1 hangs only when it is first; default ffea-then-fff1 plan subscr
   await t.connect();
   assert.equal(t.stats.recoveries, 0);
   assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
-  assert.ok(logs.some(l => /plan="ffea then fff1 \(both subscribed, RX expected on fff1\)"/.test(l)));
+  assert.ok(logs.some(l => /Attempt 1\/10 variant "ffea-s400-nodiag-enum"/.test(l)));
   const s = new ElmSession(t, { timeout: 400 });
   const obd = new Obd(s, { initTimeouts: FASTINIT });
   const info = await obd.init('0');
@@ -295,4 +296,120 @@ test('v1.4: already-connected GATT is dropped and we wait before a clean setup',
   assert.ok(logs.some(l => /GATT already connected; disconnecting and waiting/.test(l)));
   assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
   assert.equal(fake.stats.concurrentRejections, 0);
+});
+
+// ---------------- v1.5: persistent connect (the first GATT op after discovery hangs intermittently) ----------------
+const memStore = () => { const m = {}; return { get: (k) => (k in m ? m[k] : null), set: (k, v) => { m[k] = v; }, m }; };
+const RETRYBLE = { notifyTimeout: 40, writeTimeout: 60, opTimeout: 40, reconnectWait: 5, subscribeRetryDelay: 5, diagnostics: true };
+
+test('v1.5: default variant table varies settle, order, discovery and diagnostics', () => {
+  const t = new BleTransport({});
+  const plans = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => t._planFor(n));
+  assert.deepEqual(plans.slice(0, 3).map(p => p.settle), [400, 1500, 3000]);
+  assert.ok(new Set(plans.map(p => p.variant.order)).size === 2, 'alternates ffea / fff1 first');
+  assert.ok(plans.some(p => p.direct) && plans.some(p => !p.direct), 'direct getPrimaryService and enumeration both used');
+  assert.ok(plans.some(p => p.diag) && plans.some(p => !p.diag), 'diagnostics on and off both used');
+  assert.ok(plans.some(p => p.writeFirst));
+  assert.ok(plans.every(p => p.timeout === 4000), 'hang timeout is ~4s');
+  assert.equal(new Set(plans.map(p => p.variant.id)).size, 10, 'all ten variants are distinct');
+  assert.equal(t._waitFor(1), 1000); assert.equal(t._waitFor(2), 1500); assert.equal(t._waitFor(3), 2000); assert.equal(t._waitFor(9), 3000);
+});
+
+test('v1.5: first 3 connections wedge on the first post-discovery op -> attempt 4 succeeds, never gives up at 3, no concurrent ops', async () => {
+  const statuses = [];
+  const { fake, t, logs } = await setup({ wedgeFirstConnects: 3, mock: { latency: 2 } }, Object.assign({ onStatus: (m) => statuses.push(m), variantStore: memStore() }, RETRYBLE));
+  await t.connect();
+  assert.equal(fake.stats.connects, 4);
+  assert.equal(t.stats.recoveries, 3);
+  assert.equal(fake.stats.wedgedHangs, 3);
+  assert.equal(fake.stats.concurrentRejections, 0);
+  assert.ok(ids(t.subscribed).length >= 1);
+  for (let n = 1; n <= 4; n++) assert.ok(logs.some(l => new RegExp('Attempt ' + n + '/10 variant "').test(l)), 'attempt ' + n + ' logged with its variant');
+  for (let n = 1; n <= 3; n++) assert.ok(logs.some(l => new RegExp('Attempt ' + n + '/10 FAILED').test(l)));
+  assert.ok(logs.some(l => /Attempt 4\/10 OK/.test(l)));
+  assert.ok(statuses.some(m => /attempt 4\/10/.test(m)), 'visible attempt counter: ' + statuses.join(' | '));
+  assert.ok(logs.some(l => /Attempt 2\/10: disconnect, wait/.test(l)));
+  const s = new ElmSession(t, { timeout: 400 });
+  const obd = new Obd(s, { initTimeouts: FASTINIT });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+});
+
+test('v1.5: random wedging (seeded, p=0.5) -> connects within the attempt budget for many seeds', async () => {
+  let failures = 0, totalConnects = 0;
+  for (let seed = 1; seed <= 15; seed++) {
+    const { fake, t } = await setup({ wedgeProbability: 0.5, seed, mock: { latency: 1 } }, Object.assign({ postConnectDelay: 0, maxAttempts: 12 }, RETRYBLE, { diagnostics: false }));
+    try { await t.connect(); totalConnects += fake.stats.connects; assert.equal(fake.stats.concurrentRejections, 0); }
+    catch (e) { failures++; }
+  }
+  assert.equal(failures, 0, 'every seed connected within 12 attempts');
+  assert.ok(totalConnects > 15, 'some seeds needed retries (' + totalConnects + ' connects for 15 seeds)');
+});
+
+test('v1.5: gives up only after maxAttempts (fatal, with advice), link marked dead', async () => {
+  const { fake, t, logs } = await setup({ wedgeFn: () => true }, Object.assign({ maxAttempts: 5, postConnectDelay: 0 }, RETRYBLE));
+  await assert.rejects(t.connect(), (e) => e.fatal === true && /after 5 attempts/.test(e.message) && /force-stop other OBD apps/.test(e.message));
+  assert.equal(fake.stats.connects, 5);
+  assert.ok(logs.some(l => /Attempt 5\/5 FAILED/.test(l)));
+  assert.equal(t._dead, true);
+});
+
+test('v1.5: total time budget stops the retries early', async () => {
+  const { fake, t, logs } = await setup({ wedgeFn: () => true }, Object.assign({ maxAttempts: 50, totalBudget: 150, postConnectDelay: 0 }, RETRYBLE));
+  await assert.rejects(t.connect(), (e) => e.fatal === true);
+  assert.ok(fake.stats.connects >= 2 && fake.stats.connects < 50, 'connects=' + fake.stats.connects);
+  assert.ok(logs.some(l => /time budget/.test(l)));
+});
+
+test('v1.5: Cancel aborts a connect promptly, even in the middle of a hung op, and is not fatal', async () => {
+  const { fake, t, logs } = await setup({ wedgeFn: () => true }, { notifyTimeout: 5000, opTimeout: 5000, reconnectWait: 5, postConnectDelay: 0, maxAttempts: 10 });
+  const t0 = Date.now();
+  const p = t.connect();
+  setTimeout(() => t.cancel(), 120);
+  await assert.rejects(p, (e) => e.cancelled === true && !e.fatal);
+  assert.ok(Date.now() - t0 < 1500, 'cancelled promptly, took ' + (Date.now() - t0) + 'ms');
+  assert.ok(fake.stats.connects <= 2);
+  assert.equal(t._dead, false);
+  assert.equal(fake.device.gatt.connected, false);
+  assert.ok(logs.some(l => /Connect cancelled by user/.test(l)));
+});
+
+test('v1.5: the winning variant is remembered and tried first next time', async () => {
+  const store = memStore();
+  const a = await setup({ wedgeFirstConnects: 2, mock: { latency: 1 } }, Object.assign({ variantStore: store, postConnectDelay: 0 }, RETRYBLE));
+  await a.t.connect();
+  const winner = store.m['obd.bleVariant'];
+  assert.ok(winner, 'winner saved');
+  assert.equal(winner, new BleTransport({})._variantOrder()[2].id, 'third variant won (first two connections wedged)');
+  const b = await setup({ mock: { latency: 1 } }, Object.assign({ variantStore: store, postConnectDelay: 0 }, RETRYBLE));
+  assert.equal(b.t._planFor(0).variant.id, winner, 'stored winner is first in the order');
+  await b.t.connect();
+  assert.equal(b.t.stats.recoveries, 0);
+  assert.ok(b.logs.some(l => new RegExp('remembered winning variant "' + winner + '" is tried first').test(l)));
+  assert.ok(b.logs.some(l => new RegExp('Attempt 1/10 variant "' + winner + '"').test(l)));
+});
+
+test('v1.5: direct discovery variant uses getPrimaryService(fff0); skipping diagnostics avoids a link-poisoning getDescriptors', async () => {
+  const table = [
+    { id: 'diag-on', order: 'ffea', settle: 0, diag: true, direct: false, writeFirst: false },
+    { id: 'direct-diag-off', order: 'fff1', settle: 0, diag: false, direct: true, writeFirst: false }
+  ];
+  const { fake, t, logs } = await setup({ diagPoisons: true, mock: { latency: 1 } }, Object.assign({ variantTable: table, postConnectDelay: 0 }, RETRYBLE));
+  await t.connect();
+  assert.equal(t.stats.recoveries, 1);
+  assert.equal(fake.stats.directDiscoveries, 1);
+  assert.ok(logs.some(l => /getPrimaryService fff0 \(direct\) OK/.test(l)));
+  assert.ok(logs.some(l => /skipping getDescriptors/.test(l)));
+  assert.equal(t._winnerId, 'direct-diag-off');
+});
+
+test('v1.5: direct getPrimaryService falls back to enumeration when it fails', async () => {
+  const table = [{ id: 'direct', order: 'ffea', settle: 0, diag: false, direct: true, writeFirst: false }];
+  const { fake, t, logs } = await setup({ mock: { latency: 1 } }, Object.assign({ variantTable: table, postConnectDelay: 0 }, RETRYBLE));
+  const origConnect = fake.device.gatt.connect;
+  fake.device.gatt.connect = function () { return origConnect.call(this).then((srv) => Object.assign({}, srv, { getPrimaryService() { return Promise.reject(Object.assign(new Error('not found'), { name: 'NotFoundError' })); } })); };
+  await t.connect();
+  assert.ok(logs.some(l => /Direct getPrimaryService\(fff0\) failed/.test(l)));
+  assert.ok(logs.some(l => /getPrimaryServices OK/.test(l)));
+  assert.equal(t.stats.recoveries, 0);
 });

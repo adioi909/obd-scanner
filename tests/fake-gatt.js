@@ -6,9 +6,20 @@ const { MockTransport, uuid16 } = require('../js/transport.js');
 function createFakeGattDongle(opts) {
   opts = opts || {};
   const U = { svc: uuid16('fff0'), ffea: uuid16('ffea'), fff1: uuid16('fff1'), fff2: uuid16('fff2') };
-  const stats = { concurrentRejections: 0, fakeBusy: 0, connects: 0, disconnects: 0, startNotif: [], writes: [] };
+  const stats = { wedgedHangs: 0, directDiscoveries: 0, concurrentRejections: 0, fakeBusy: 0, connects: 0, disconnects: 0, startNotif: [], writes: [] };
   const discListeners = [];
   const once = { hang: {}, fail: {} };
+  // v1.5: a "wedged" connection models the real clone: discovery works, then the FIRST other GATT op hangs and the link
+  // stays wedged (every later op hangs too) until disconnect. wedgeFirstConnects: N | wedgeProbability+seed | wedgeFn(i).
+  let wedged = false, rngState = (opts.seed || 1) >>> 0;
+  const rnd = () => { rngState = (Math.imul(rngState, 1664525) + 1013904223) >>> 0; return rngState / 4294967296; };
+  const DISCOVERY = ['getPrimaryServices', 'getPrimaryService', 'getCharacteristics'];
+  function decideWedge(i) {
+    if (typeof opts.wedgeFn === 'function') return !!opts.wedgeFn(i);
+    if (opts.wedgeFirstConnects && i <= opts.wedgeFirstConnects) return true;
+    if (opts.wedgeProbability) return rnd() < opts.wedgeProbability;
+    return false;
+  }
   let busy = false, busyWrites = opts.busyOnWrites || 0, writtenSinceConnect = false, notifsThisConnect = 0;
   const elm = new MockTransport(Object.assign({ latency: 0 }, opts.mock || {}));
   if (opts.silent) elm.write = async function () {};
@@ -20,6 +31,8 @@ function createFakeGattDongle(opts) {
       const e = new Error('GATT Server is disconnected. Cannot perform GATT operations.'); e.name = 'NetworkError'; return Promise.reject(e);
     }
     if (busy) { stats.concurrentRejections++; return Promise.reject(new Error('GATT operation already in progress.')); }
+    if (wedged && !DISCOVERY.includes(label)) { stats.wedgedHangs++; busy = true; return new Promise(() => {}); }
+    if (opts.diagPoisons && (label === 'getDescriptors' || label === 'readValue')) { stats.wedgedHangs++; busy = true; return new Promise(() => {}); }
     const r = fn();
     if (r.hang) { busy = true; return new Promise(() => {}); } // never settles; busy until disconnect
     if (r.fakeBusy) { stats.fakeBusy++; return Promise.reject(new Error('GATT operation already in progress.')); }
@@ -85,12 +98,20 @@ function createFakeGattDongle(opts) {
   elm.onData = function (s) { const t = byUuid[opts.respondOn || U.fff1]; if (t._notifying) t._emit(s); };
 
   const service = { uuid: U.svc, getCharacteristics() { return op('getCharacteristics', () => ({ value: [ffea, fff1, fff2] })); } };
-  const server = { getPrimaryServices() { return op('getPrimaryServices', () => ({ value: [service] })); } };
+  const server = {
+    getPrimaryServices() { return op('getPrimaryServices', () => ({ value: [service] })); },
+    getPrimaryService(uuid) {
+      return op('getPrimaryService', () => {
+        if (uuid !== U.svc) { const e = new Error('No Services matching UUID ' + uuid + ' found in Device.'); e.name = 'NotFoundError'; return { error: e.message }; }
+        stats.directDiscoveries++; return { value: service };
+      });
+    }
+  };
   const device = {
     name: 'OBDII', id: 'fake',
     gatt: {
       connected: false,
-      connect() { stats.connects++; device.gatt.connected = true; writtenSinceConnect = false; notifsThisConnect = 0; return new Promise(r => setTimeout(() => r(server), delay)); },
+      connect() { stats.connects++; wedged = decideWedge(stats.connects); device.gatt.connected = true; writtenSinceConnect = false; notifsThisConnect = 0; return new Promise(r => setTimeout(() => r(server), delay)); },
       disconnect() {
         if (!device.gatt.connected) return;
         device.gatt.connected = false; busy = false; writtenSinceConnect = false; notifsThisConnect = 0; stats.disconnects++;
