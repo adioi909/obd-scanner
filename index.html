@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d1117">
-<title>OBD Scanner v1.3</title>
+<title>OBD Scanner v1.4</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon.svg">
@@ -12,7 +12,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.3</small></div>
+  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.4</small></div>
   <div id="status" class="pill off" role="status">Disconnected</div>
 </header>
 
@@ -77,7 +77,7 @@
         <select id="s-notify"><option value="auto">Auto (fff1 first)</option><option value="fff1">fff1 only</option><option value="ffea">ffea only</option></select>
       </label>
       <label class="row">Command timeout (ms)<input type="number" id="s-timeout" min="500" max="10000" step="100"></label>
-      <p class="hint">BLE write mode and notify characteristic apply on the next connect. If live data stalls or shows "--" on a real car, turn off Multi-PID and Fast response, then reconnect.</p>
+      <p class="hint">BLE write mode and notify characteristic apply on the next connect. v1.4 automatically falls back from multi-PID to single-PID if a live request does not decode, and logs every live request and response. Pull-to-refresh is disabled so it cannot drop the Bluetooth session.</p>
     </div>
   </section>
 
