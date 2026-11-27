@@ -1,8 +1,16 @@
-# OBD Scanner (v1.4)
+# OBD Scanner (v1.5)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
+
+## v1.5 persistent connect (intermittent first-op hang)
+On the real dongle (Realtek RTL8773BFR clone) the first GATT operation after discovery **hangs intermittently**, whichever characteristic is touched first (v1.3 got through on a later reconnect; v1.4 hung on ffea, fff1, ffea and a write in one run). A hung op wedges the whole link (even writes hang) until you disconnect, so channel order is not the fix. v1.5 instead keeps reconnecting and varies what it does:
+
+- **Up to 10 attempts / ~90 s**, with a visible counter ("Connecting… attempt 4/10") and a **Cancel** button. Hang timeouts are ~4 s (a hang never recovers, so fail fast and reconnect fresh).
+- **Ten variants**, cycled: which notify characteristic goes first (ffea/fff1), settle delay after connect before the first op (400 / 1500 / 3000 ms), discovery with `getPrimaryServices()` or directly `getPrimaryService('fff0')`, diagnostics (`getDescriptors` / `getDescriptor(0x2902)`) on or off, and one write-first variant. Wait after disconnect before reconnecting grows 1 s / 1.5 s / 2 s / 3 s so the dongle's own BLE stack can reset.
+- If one notify characteristic subscribes and the next one hangs, the following attempt puts the one that worked first and keeps the other in reserve (init subscribes it only if no RX arrives).
+- Every attempt logs its variant, settle, discovery mode, diagnostics on/off and the result. The **winning variant is stored in localStorage** (`obd.bleVariant`) and tried first next time.
 
 ## v1.4 live data and a faster connect
 v1.3 connected on the real 2013 Mitsubishi (ELM327 v1.5, ISO 15765-4 CAN 11/500, 39 PIDs). The working BLE recipe is: subscribe **ffea first, then fff1**, and listen on **fff1** (writes go to fff2 with writeWithoutResponse). v1.4 does that on the first attempt instead of burning a 5s fff1 hang plus a 12s ATZ timeout on the wrong channel. Rotation and write-first stay as fallbacks. If a later subscribe hangs after an earlier one succeeded, the next reconnect retries only the characteristic that worked.
