@@ -1,7 +1,22 @@
-# OBD Scanner (v1.6)
+# OBD Scanner (v1.6.1)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
+
+**User manual and tips:** see [MANUAL.md](MANUAL.md) in this repo, or open **Help** in the app header
+(https://adioi909.github.io/obd-scanner/manual.html). A printable PDF is built as
+`OBD-Scanner-v1.6-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
+on the vehicle (the only UI write is Mode 04 clear codes / reset MIL, which also resets readiness
+monitors), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+
+## v1.6.1 freeze frame empty state and Help
+v1.6 already worked on the car. After a recorded Quick look session, Read codes and Freeze frame are
+blocked with "Stop recording first" until you stop (a toast reports how many samples were saved).
+Read codes found pending P0420 and 0 stored. Freeze frame is only stored with a confirmed (Mode 03)
+code, so a pending-only P0420 usually has none — in v1.6 the "Reading freeze frame..." card could look
+like nothing appeared. v1.6.1 shows a clear empty message: "No freeze frame stored (normal when there
+are only pending codes)," plus a toast, and scrolls that card into view. A Help link in the header
+opens the user manual.
 
 
 ## v1.6 live gauges and profile switching
