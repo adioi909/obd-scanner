@@ -1,6 +1,6 @@
 # OBD Scanner User Manual
 
-**Version 1.6.1** (a small follow-up to 1.6)  
+**Version 1.7.0**  
 Field OBD-II scanner for Chrome on Android and a Bluetooth LE ELM327-style dongle.
 
 Live app: https://adioi909.github.io/obd-scanner/  
@@ -29,6 +29,8 @@ This manual describes what the app actually does. It does not invent features. N
 14. [This vehicle (2013 Mitsubishi reference)](#14-this-vehicle-2013-mitsubishi-reference)
 15. [Updating the app](#15-updating-the-app)
 16. [Built-in PID library](#16-built-in-pid-library)
+17. [Mitsubishi CVT (Experimental)](#17-mitsubishi-cvt-experimental)
+18. [What changed in v1.7.0](#18-what-changed-in-v1-7-0)
 
 ---
 
@@ -64,7 +66,7 @@ If Web Bluetooth is not available, the Connect tab shows a warning. **Demo mode*
 
 The service worker caches the app so it can still load in a shop with no signal. It is network-first, so when you do have signal it tries to fetch the latest files.
 
-To confirm the version, look at the small version label next to the **OBD Scanner** title (currently **v1.6.1**).
+To confirm the version, look at the small version label next to the **OBD Scanner** title (currently **v1.7.0**).
 
 ---
 
@@ -142,7 +144,17 @@ Pull-to-refresh is disabled in the app so a downward swipe cannot reload the pag
 3. Each tile shows the current value, unit, and min / max for this live session.
 4. Tap **Record** to start saving samples (see [Record and Logs](#7-record-and-logs)).
 
-While live (including while recording) the app requests a **wake lock** so the phone is less likely to sleep and drop the link. That is not a guarantee; see Tips.
+While live (including while recording) the app requests a **wake lock** so the phone is less likely to sleep and drop the link. Chrome drops that lock every time the app goes to the background or the screen locks; since v1.7.0 the app asks for it again automatically as soon as you come back. That is still not a guarantee; see Tips.
+
+### Background gaps
+
+Android throttles or pauses a background tab, so polling stops while you are in another app or the screen is off. When you come back during Live, v1.7.0:
+
+- logs a line like `[BACKGROUND GAP: 42.5s]` in the Console,
+- if a recording is running, stores the gap (start, end, seconds) with the session; the session view lists the gaps,
+- abandons any command that was waiting for a reply when the tab was hidden (it would otherwise sit until its timeout), so polling resumes right away instead of stalling.
+
+Recorded data has no samples inside a gap. That is honest: nothing was read then. Keep the app in the foreground for a complete log.
 
 You can change profiles **while live is running**, including while recording. The next poll uses the new profile's supported PIDs.
 
@@ -174,6 +186,8 @@ An N/S tile will never get a number on that car. That does not mean the sensor i
 | Fuel trims | STFT B1, LTFT B1, STFT B2, LTFT B2, O2 B1S1, O2 B1S2, MAF, RPM, Engine load, Coolant |
 | Air intake | MAF, MAP, Intake air, Baro, Throttle, RPM, Engine load |
 | O2 / Catalyst | O2 B1S1, O2 B1S2, O2 B2S1, O2 B2S2, Cat temp B1S1, Cat temp B1S2, STFT B1, LTFT B1, RPM |
+| Charging / electrical | Module voltage, RPM, Engine load, Coolant |
+| Mitsubishi CVT (Experimental) | CVT temp (Exp), CVT N-55 (Exp), CVT raw N (Exp), Coolant, RPM. Read-only Mode 21 request to the transmission module. See [section 17](#17-mitsubishi-cvt-experimental) |
 
 Unsupported PIDs in a preset still appear as N/S so you can see what the profile asked for.
 
@@ -194,6 +208,10 @@ Open the **Logs** tab to see recorded sessions: name, sample count, duration, av
 - **Back** returns to the session list.
 
 Recorded data stays on the phone (IndexedDB). It is not uploaded anywhere.
+
+**How samples are saved (v1.7.0).** Samples are buffered in memory and written in batches: every 25 samples or every 3 seconds, whichever comes first, in one database transaction each. The buffer is also written immediately when you tap Stop recording, when the app goes to the background (`visibilitychange` hidden), on `pagehide`, and before the page unloads, so the last few seconds are not lost. If a write fails, the rows are kept and retried on the next batch.
+
+**Long drives (v1.7.0).** A session with more than 1,000 samples is downsampled **for drawing only**, using LTTB (Largest-Triangle-Three-Buckets) to roughly 500–800 points depending on the screen width. LTTB keeps the shape, including single-sample spikes and dips. The **min / avg / max** numbers above each chart and the **CSV export** always use every recorded sample. The session view says "charts downsampled for drawing" when that happens.
 
 If you try to leave the page while a recording is in progress, the browser will warn you. Still, stop recording before you close the app.
 
@@ -281,6 +299,29 @@ The Console is a raw terminal to the ELM327.
 
 The on-screen view shows recent lines; the copied log can include more (the app keeps a larger ring buffer).
 
+### Write interlock (v1.7.0)
+
+Before the Console sends a command that can change the vehicle, it shows a warning and asks you to confirm. **Cancel is the default** (it has focus, and Back / Escape cancels). Nothing is sent unless you tap **Send anyway**. The interlock covers commands whose first byte is:
+
+| First byte | Service |
+|---|---|
+| 04 | Mode 04: clear DTCs, freeze frame and readiness monitors |
+| 10 | UDS DiagnosticSessionControl |
+| 11 | UDS ECUReset |
+| 27 | UDS SecurityAccess |
+| 2E | UDS WriteDataByIdentifier |
+| 2F | UDS InputOutputControlByIdentifier |
+| 31 | UDS RoutineControl |
+| 34 / 36 / 37 | UDS RequestDownload / TransferData / RequestTransferExit (reprogramming) |
+
+Read requests (01, 02, 03, 07, 09, 0A, 21, 22 and AT commands) are sent without a prompt. The interlock is a speed bump, not a lock: it checks the first byte only, and a confirmed command goes out exactly as typed.
+
+### Adapter-state warning (v1.7.0)
+
+Some AT commands change how the adapter formats replies or which module it talks to: **ATZ, ATD, ATE, ATH, ATS (spaces), ATSP, ATSH, ATCAF, ATCRA** (and ATWS / ATTP). When you send one of these from the Console, the app marks the adapter as "dirty" and shows a yellow banner under the header naming the command, with a **Re-run init** button. Read-only AT commands (ATI, ATRV, ATDP, ATDPN) do not trigger it.
+
+If you start Live while the adapter is dirty, Live first re-syncs the settings the parser depends on — `ATE0 ATL0 ATS0 ATH0 ATAL ATCAF1`, then `ATSH7DF` and `ATCRA` (plus `ATAT1` and your protocol after ATZ / ATD / ATSP) — and then polls. Re-run init does the full init and also clears the banner.
+
 ### Useful commands (cheat sheet)
 
 | Command | What you get |
@@ -297,18 +338,21 @@ The on-screen view shows recent lines; the copied log can include more (the app 
 | 03 | Stored DTCs (raw) |
 | 07 | Pending DTCs (raw) |
 | 0A | Permanent DTCs (raw) |
-| 04 | Clear DTCs — same write as the Clear codes button; same consequences |
+| 04 | Clear DTCs — same write as the Clear codes button; same consequences. Asks for confirmation first (v1.7.0) |
+| ATSH7E1, ATCRA7E9, 2103, ATSH7DF, ATCRA | The experimental CVT read by hand (see section 17). The ATSH / ATCRA lines will show the adapter-state banner; tap Re-run init afterwards |
 | 06 | Mode 06 (on-board test results). **Not decoded in this app.** You can send it here; you will see raw hex only |
 
 ### Warning
 
-The Console has **no safety interlock**. It will send whatever you type, including write commands (Mode 04, and any manufacturer write if you know one). Do not paste commands you do not understand. See Capabilities and limits.
+The interlock asks before write-capable commands, but once you confirm, the Console will send whatever you typed. Do not paste commands you do not understand. See Capabilities and limits.
 
 ---
 
 ## 11. Capabilities and limits: what can it change on the vehicle?
 
-Short answer: **with this app, a generic ELM327 clone, and standard OBD-II, the only thing the user interface can change on the vehicle is clearing codes and turning the MIL off (Mode 04).** That also resets readiness monitors. Everything else in the app is read-only.
+Short answer: **with this app, a generic ELM327 clone, and standard OBD-II, the only button that changes the vehicle is Clear codes / reset MIL (Mode 04).** That also resets readiness monitors. Every other button, tab and preset is read-only, including the experimental Mitsubishi CVT preset (a Mode 21 read).
+
+The one honest exception is the **raw Console**: it can send any command you type. Since v1.7.0, write-capable commands (Mode 04 and UDS 10, 11, 27, 2E, 2F, 31, 34, 36, 37) only go out after an explicit confirmation, with Cancel as the default. So writes other than the Clear codes button are possible **only** by typing them into the raw Console and confirming. The app does not build those commands for you, has no undo, and does not know whether a module will accept them (most need security access the app does not have).
 
 ### What the app can do today
 
@@ -321,8 +365,10 @@ Short answer: **with this app, a generic ELM327 clone, and standard OBD-II, the 
 | Stored / pending / permanent codes | Modes 03 / 07 / 0A | Read codes | No (read) |
 | VIN | Mode 09 PID 02 | Vehicle card; Console chip 0902 | No (read) |
 | Adapter ID, voltage, protocol | ATI, ATRV, ATDPN | Vehicle card and Console | No |
+| Mitsubishi CVT fluid temperature (Experimental) | Mode 21, request 2103 on header 7E1 (reply filter 7E9) | Mitsubishi CVT (Experimental) preset | No (read). Header is restored to 7DF afterwards |
 | Record a drive and export CSV | — | Live / Logs | No |
-| **Clear codes / reset MIL** | **Mode 04** | **Clear codes button, and Console if you send 04** | **Yes — erases codes and freeze frame, resets readiness** |
+| **Clear codes / reset MIL** | **Mode 04** | **Clear codes button, and Console if you send 04 and confirm** | **Yes — erases codes and freeze frame, resets readiness** |
+| Raw UDS / manufacturer commands | Anything typed in Console; 10/11/27/2E/2F/31/34/36/37 need confirmation | Console only | Possibly. Depends on the command and the module; usually rejected without security access |
 
 Mode 09 in this app is **VIN only** (0902). Calibration ID, CVN, and other Mode 09 PIDs are not requested automatically. You can type them in Console (for example 0904) and you will see the raw reply; the app will not decode them.
 
@@ -341,11 +387,11 @@ These need manufacturer software and usually better hardware (MUT-III for Mitsub
 | TPMS relearn | Module-specific, often not on the OBD-II emissions bus in a useful way. |
 | Service resets (oil light, SAS, battery registration, DPF regen start, and similar) | Manufacturer-specific. Not in the standard PID set. |
 | ABS bleeding / ABS or SRS codes | Those modules are usually not reached by generic Mode 01–0A on this adapter. |
-| Mitsubishi enhanced PIDs (MUT / Mode 21 or 22) | Not implemented. README notes they would need a new request path in the app. You could type a Mode 22 read in Console and see raw bytes; there is no decoder and no write path. |
+| General Mitsubishi enhanced PIDs (MUT / Mode 21 or 22) | v1.7.0 has a read-only framework for them (per-PID header, grouping, N/S fallback) but ships only one experimental PID set (CVT fluid temperature). Other enhanced values would need their request and byte offsets added to `js/pids.js`. There is no enhanced write path. |
 
 ### What might be possible later (read-only first)
 
-- **Enhanced read PIDs** (UDS 0x22 or Mitsubishi Mode 21/22) for sensors that are not in standard Mode 01 — for example a better oil-temperature or catalyst-efficiency value — if the request format for that ECU is known. That would still be read-only.
+- **More enhanced read PIDs** (UDS 0x22 or Mitsubishi Mode 21/22) for sensors that are not in standard Mode 01 — for example a better oil-temperature value — if the request format and byte offsets for that module are known. The framework added in v1.7.0 makes these a data-only change. They would still be read-only.
 - **Mode 06** decoding, if a later version adds it, is also read-only and can help with pending catalyst or oxygen-sensor monitors.
 - More **Mode 09** fields (calibration ID, which was already known for this car as 1860C0360001 from other tools).
 
@@ -355,8 +401,8 @@ None of those change the vehicle.
 
 Because Console sends raw commands:
 
-- `04` clears codes and readiness, same as the button, but without the confirmation dialog.
-- Adapter commands (ATSP, ATZ, ATH1, and so on) can change how the ELM talks to the bus. If you confuse the adapter, use **Re-run init** or Disconnect and Connect again.
+- `04` clears codes and readiness, same as the button. It now asks for confirmation (v1.7.0).
+- Adapter commands (ATSP, ATZ, ATH1, ATSH, ATCRA, and so on) can change how the ELM talks to the bus. The app shows the adapter-state banner; use **Re-run init**, or start Live and let it re-sync.
 - Manufacturer **write** services (UDS 0x2E, 0x31, security-access 0x27, and similar) should not be sent unless you know exactly what you are doing. A wrong write can change coding, disable functions, or in the worst case brick a module. This app does not help you build those commands, and you should not experiment with them on a car you need.
 
 ---
@@ -399,7 +445,7 @@ Module voltage (PID 42) and ATRV should be roughly **13.5–14.7 V** with the en
 
 ### Keeping the phone awake
 
-The app requests a Screen Wake Lock while live data is running and releases it when you stop. Some Android skins ignore this. Practical extras: keep the app in the foreground, plug the phone in, raise the screen timeout, and turn off battery savers for Chrome.
+The app requests a Screen Wake Lock while live data is running and releases it when you stop. Chrome drops the lock whenever the tab is hidden; v1.7.0 asks for it again when you return. Some Android skins ignore wake locks entirely. Gaps while you were away show up as `[BACKGROUND GAP: Xs]` in the Console and in the session. Practical extras: keep the app in the foreground, plug the phone in, raise the screen timeout, and turn off battery savers for Chrome.
 
 ### Bluetooth habits that actually helped on this dongle
 
@@ -429,7 +475,13 @@ The app requests a Screen Wake Lock while live data is running and releases it w
 | Clear codes confirmation looks scary | It is supposed to | Read it. Clearing resets readiness and can fail an emissions test until a drive cycle completes. Permanent codes will remain. |
 | Live rate is very low | Many PIDs, single-PID fallback, long timeout | Use a shorter profile. If fallback keeps happening, leave Multi-PID off and accept a slower but reliable rate. |
 | Phone sleeps and the link drops | Wake lock ignored by the OS | Keep the app foreground, plug in, raise screen timeout, disable battery optimization for Chrome. |
-| App looks like an old version | Cached service worker or an old tab | Close every OBD Scanner tab / the PWA, reopen, or add `?v=1.6.1` to the URL once. Check the header version. |
+| App looks like an old version | Cached service worker or an old tab | Close every OBD Scanner tab / the PWA, reopen, or add `?v=1.7.0` to the URL once. Check the header version. |
+| Yellow "Adapter settings changed from the Console" banner | You sent ATZ / ATD / ATE / ATH / ATS / ATSP / ATSH / ATCAF / ATCRA by hand | Tap Re-run init, or start Live (it re-syncs first). |
+| Console asks "Send a write / control command?" | The command starts with 04 / 10 / 11 / 27 / 2E / 2F / 31 / 34 / 36 / 37 | Cancel unless you are sure. Send anyway sends it exactly as typed. |
+| `[BACKGROUND GAP: Xs]` in the Console | The app was in the background or the screen was off; Chrome paused polling | Normal. Keep the app in front during a recording you need complete. |
+| CVT temp (Exp) tiles go N/S | The transmission module did not answer 2103 on 7E1 three times in a row (NO DATA, timeout, or the adapter rejected ATSH) | Mode 01 keeps working. Re-run init to try again. Copy the Console log; the EXP lines show what came back. |
+| CVT temp reads implausibly (for example far above coolant after an overnight cold soak) | Formula / byte offset differs for this TCM firmware | Compare the three CVT tiles and the raw byte in the Console at a cold start (see section 17). |
+| Charts look smoother than the data on a long drive | LTTB downsampling for drawing | Stats and CSV still use every sample. |
 | CSV looks empty for some columns | Those PIDs were added mid-recording after a profile switch, or were N/S / -- | Expected. Only rows after a PID starts appearing will have values. |
 | Share button missing in Logs | Browser has no Web Share API | Use Export CSV / the list CSV button and open the file in Sheets or Excel. |
 | Pull-to-refresh does nothing | Disabled on purpose | Good — a refresh would drop Bluetooth. Use Disconnect / Connect if you really need a clean start. |
@@ -466,7 +518,7 @@ If the header still shows an old version:
 
 1. Close every OBD Scanner tab, and swipe the PWA away from Recents.
 2. Reopen the site or the home-screen icon.
-3. If it is still stuck, open the URL with a cache-buster once, for example `https://adioi909.github.io/obd-scanner/?v=1.6.1`.
+3. If it is still stuck, open the URL with a cache-buster once, for example `https://adioi909.github.io/obd-scanner/?v=1.7.0`.
 4. Confirm the small version label in the header.
 
 Settings, custom profiles, and recorded logs stay on the phone across updates.
@@ -546,4 +598,49 @@ Imperial conversions when that unit system is selected: temperatures in °F, spe
 
 ---
 
-*OBD Scanner v1.6.1. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
+---
+
+## 17. Mitsubishi CVT (Experimental)
+
+An opt-in preset, **Mitsubishi CVT (Experimental)**, reads the CVT fluid temperature from the transmission control module (TCM) of the 2013 Lancer (Jatco JF011E, Mitsubishi F1CJA). It is **read-only**: it sends a Mode 21 read request and never writes anything. It is experimental because Mitsubishi does not publish these offsets and they vary by TCM firmware.
+
+**What the app sends** (only when that preset is selected, at most about every 2 seconds, after the normal Mode 01 requests of that cycle):
+
+```
+ATSH7E1      (address the TCM)
+ATCRA7E9     (only accept the TCM's replies)
+2103         (Mode 21, local identifier 03; multi-frame reply 61 03 + data bytes)
+ATSH7DF      (back to the standard OBD broadcast header)
+ATCRA        (clear the receive filter)
+```
+
+The header switch is only sent when the target module changes, and all three CVT tiles share one 2103 request. The app always restores 7DF and clears the filter afterwards — after a good reply, NO DATA, a timeout, or if the adapter rejects ATSH — and again when Live stops, so standard polling is never left pointed at the TCM. If the adapter rejects ATCRA, the read still runs without the filter.
+
+**Decoding.** Let N be data byte 13 after `61 03` (Torque's letter **N**, the 14th data byte).
+
+| Tile | Formula | Where it comes from |
+|---|---|---|
+| CVT temp (Exp) | 0.000000002344·N⁵ − 0.000001387·N⁴ + 0.0003193·N³ − 0.03501·N² + 2.302·N − 36.6 (°C) | Community Torque lists for the JF011E-era Mitsubishi CVT: out-club.ru Outlander III thread ("(Out3) CVT temp", 2103, header 7E1) and elm3.ru's Mitsubishi Outlander 2008-2015 list ("CVT temp 1") |
+| CVT N-55 (Exp) | N − 55 (°C) | Same out-club.ru list, labelled "(Out3 CVT8)" — the newer JF016E CVT8. A Lancer X owner on drive2.ru reported it worked on his car (cold 25 °C, warm ~80 °C) after the polynomial read high |
+| CVT raw N (Exp) | N (count) | The raw byte, so you can check either formula yourself |
+
+The sources disagree because Lancer X cars shipped with different CVT generations. On drive2.ru, one Lancer X owner reported a polynomial formula correct on his car while another needed N−55. The two published polynomials agree within about 3 °C of each other, which suggests they model the same sensor. The app uses the polynomial as the main value because the 2013 Lancer has the JF011E. It shows N−55 next to it in case this TCM behaves like the newer unit.
+
+**How to verify on the car.** After the car has sat overnight (everything at ambient), key on, connect, choose the Mitsubishi CVT (Experimental) preset and Start live. The right formula should read close to ambient air and coolant at a cold start. The CVT should then warm more slowly than the coolant. The Console logs every reply, for example:
+`EXP 7E1/7E9 2103 raw (20 data bytes): 10 11 ... | data[13] (Torque N) = 0x64 = 100 -> CVT temp (Exp)=47.5, CVT N-55 (Exp)=45, CVT raw N (Exp)=100`.
+Copy that log if neither formula matches.
+
+**If the car does not answer.** NO DATA or a timeout on 7E1 three times in a row marks the CVT tiles **N/S** and stops asking (Re-run init resets that). Coolant and RPM keep updating from Mode 01 either way.
+
+---
+
+## 18. What changed in v1.7.0
+
+- **Service worker:** only the app shell and the small Help page are precached. MANUAL.md, PDFs, GROK_BUILD_BRIEF.md and zips are never cached by the service worker, so updates stay small on mobile data. Help loads the manual on demand when online.
+- **Console safety:** write interlock (Cancel by default) and the adapter-state banner, with automatic re-sync before Live.
+- **Long drives:** LTTB downsampling for charts above 1,000 samples; stats and CSV use all samples. Batched database writes (25 samples / 3 s) with forced flushes on stop, background and pagehide.
+- **Background recovery:** the wake lock is requested again on return, the stale in-flight command is abandoned, and `[BACKGROUND GAP: Xs]` is logged and stored with the session.
+- **Enhanced PIDs:** read-only Mode 21/22 framework with per-PID headers (grouped, only switched when needed, always restored to 7DF) and the experimental Mitsubishi CVT preset.
+- Unchanged: the Bluetooth connect / retry logic (10 attempts, ffea-then-fff1, writeWithoutResponse on FFF2, remembered variant).
+
+*OBD Scanner v1.7.0. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
