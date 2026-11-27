@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d1117">
-<title>OBD Scanner v1.4</title>
+<title>OBD Scanner v1.5</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon.svg">
@@ -12,7 +12,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.4</small></div>
+  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.5</small></div>
   <div id="status" class="pill off" role="status">Disconnected</div>
 </header>
 
@@ -32,6 +32,12 @@
         <button id="btn-forget" class="btn big ghost">Forget and re-pick device</button>
       </div>
       <p class="hint">Plug the dongle in, key ON (engine running is fine). Pick the device named <b>OBDII</b>. If it doesn't show, use "Show all Bluetooth devices". Close Torque / Car Scanner first: a BLE dongle only talks to one app at a time.</p>
+    </div>
+    <div id="conn-progress" class="card hidden">
+      <h2>Connecting</h2>
+      <div id="conn-progress-text" class="mono">Starting…</div>
+      <p class="hint">The dongle sometimes hangs its first Bluetooth operation. The app keeps reconnecting with different timing (up to 10 attempts, about 90 seconds). Cancel stops it.</p>
+      <button id="btn-cancel-connect" class="btn big danger full">Cancel</button>
     </div>
     <div id="conn-help" class="card warn hidden">
       <b>Couldn't get a working Bluetooth link.</b> Force-stop other OBD apps (Car Scanner / Torque, including "work in background"), toggle Bluetooth off and on, and unpair <b>OBDII</b> in Android Bluetooth settings if it is listed. Then tap <b>Forget and re-pick device</b>, and Connect dongle again. Watch for a pairing prompt on the phone. Then open Console and Copy log.

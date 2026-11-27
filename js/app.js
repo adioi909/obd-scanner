@@ -1,13 +1,13 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.4';
+  var APP_VERSION = 'v1.5';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
   var settings = Store.loadSettings();
   var profiles = Store.loadProfiles();
-  var state = { lastDevice: null, transport: null, session: null, obd: null, connected: false, live: false, recording: null, supported: null, vin: null };
+  var state = { lastDevice: null, transport: null, session: null, obd: null, connected: false, connecting: null, live: false, recording: null, supported: null, vin: null };
 
   // ---------------- Console log ----------------
   var LOG_MAX = 1500, logLines = [];
@@ -99,20 +99,24 @@
       if (kind === 'mock') t = new Transport.MockTransport({ log: log });
       else {
         if (!Transport.BleTransport.isSupported()) { toast('Web Bluetooth not available here. Use Chrome on Android.'); return; }
-        t = new Transport.BleTransport({ log: log, writeMode: settings.writeMode, notifyChar: settings.notifyChar, onStatus: function (m) { setStatus('busy', m); } });
+        t = new Transport.BleTransport({ log: log, writeMode: settings.writeMode, notifyChar: settings.notifyChar, onStatus: function (m) { setStatus('busy', m); var pt = $('#conn-progress-text'); if (pt) pt.textContent = m; } });
         await t.request(acceptAll); // must run directly from the click gesture
         state.lastDevice = t.device;
       }
       setStatus('busy', 'Connecting…');
+      if (t.kind === 'ble') { state.connecting = t; $('#conn-progress-text').textContent = 'Connecting…'; $('#conn-progress').classList.remove('hidden'); $('#conn-help').classList.add('hidden'); }
       await t.connect();
     } catch (e) {
       log('warn', 'Connect failed: ' + (e && e.message));
-      var cancelled = e && e.name === 'NotFoundError';
-      setStatus('err', cancelled ? 'Disconnected' : 'Connect failed');
+      var userCancelled = e && (e.name === 'NotFoundError' || e.cancelled);
+      setStatus(userCancelled ? 'off' : 'err', userCancelled ? 'Disconnected' : 'Connect failed');
+      state.connecting = null; $('#conn-progress').classList.add('hidden');
       if (t && t.disconnect && t.device) { try { await t.disconnect(); } catch (x) { /* ignore */ } }
-      if (!cancelled) { $('#conn-help').classList.remove('hidden'); toast('Connect failed: ' + (e && e.message), 8000); }
+      if (e && e.cancelled) toast('Connect cancelled', 3000);
+      else if (!userCancelled) { $('#conn-help').classList.remove('hidden'); toast('Connect failed: ' + (e && e.message), 8000); }
       return;
     }
+    state.connecting = null; $('#conn-progress').classList.add('hidden');
     $('#conn-help').classList.add('hidden');
     state.transport = t;
     t.onDisconnect = function () { onLinkLost(); };
@@ -188,6 +192,7 @@
     $('#btn-disconnect').classList.add('hidden'); $('#btn-reinit').classList.add('hidden');
   }
 
+  $('#btn-cancel-connect').onclick = function () { if (state.connecting) { setStatus('busy', 'Cancelling…'); state.connecting.cancel(); } };
   $('#btn-connect').onclick = function () { connect('ble', false); };
   $('#btn-connect-all').onclick = function () { connect('ble', true); };
   $('#btn-mock').onclick = function () { connect('mock'); };
