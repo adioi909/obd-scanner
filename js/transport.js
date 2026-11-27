@@ -122,16 +122,18 @@
    */
   BleTransport.prototype._runOp = async function (label, fn, o) {
     o = o || {};
-    var timeout = o.timeout || this._opt('opTimeout', 5000);
+    var timeout = o.timeout || this._opt('opTimeout', 4000);
     var delays = this._opt('busyDelays', [150, 300, 600, 1000, 1500]);
     var busy = 0, t0 = Date.now();
     for (;;) {
       if (!o.quiet) this.log('info', 'GATT ' + label + ' ...');
       try {
-        var v = await withTimeout(Promise.resolve().then(fn), timeout, label);
+        var work = Promise.resolve().then(fn);
+        var v = await withTimeout(this._cancelP ? Promise.race([work, this._cancelP]) : work, timeout, label);
         if (!o.quiet) this.log('info', 'GATT ' + label + ' OK (' + (Date.now() - t0) + 'ms)');
         return v;
       } catch (e) {
+        if (e && e.cancelled) throw e;
         if (e && e.timeout) { this._poisoned = true; this.log('warn', 'GATT ' + label + ' HUNG (' + timeout + 'ms) -> link poisoned, will reconnect'); throw e; }
         if (isBusyError(e)) {
           if (busy < delays.length) {
@@ -155,57 +157,156 @@
   var CHAR_PROP_KEYS = ['broadcast', 'read', 'writeWithoutResponse', 'write', 'notify', 'indicate', 'authenticatedSignedWrites', 'reliableWrite', 'writableAuxiliaries'];
 
   /**
-   * Connect plan for attempt n (0 = first try, 1.. = reconnects).
-   * This dongle (FFF0 / FFF1+FFEA notify, FFF2 write) hangs startNotifications on fff1 when it is tried first,
-   * but works when ffea is subscribed first and fff1 is subscribed second; replies then arrive on fff1.
-   * Default plan therefore subscribes BOTH, ffea then fff1. Rotation and write-first stay as fallbacks.
-   * Do not reorder to put the RX characteristic (fff1) first on reconnect — that is what hung.
+   * v1.5: the first GATT operation after discovery hangs INTERMITTENTLY on this clone (Realtek RTL8773BFR), whichever
+   * characteristic is tried first, and a hung op wedges the whole link (even writes hang). So channel order is not the
+   * fix: we keep reconnecting with different timing / discovery / diagnostics variants, fail fast (~4s), and remember the
+   * variant that worked. Each variant: order (which notify char first), settle (ms after connect before the first
+   * GATT op), diag (getDescriptors/getDescriptor before subscribing), direct (getPrimaryService('fff0') instead of
+   * getPrimaryServices()), writeFirst (write ATZ before startNotifications).
    */
-  BleTransport.prototype._planFor = function (n) {
-    var T = this._opt('notifyTimeout', 5000);
-    if (n > 0 && this._partialHang && this._partialHang.worked && this._partialHang.worked.length) {
-      var worked = this._partialHang.worked.slice();
-      this._partialHang = null;
-      return { n: n, onlyUuids: worked, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: true, name: 'retry only ' + worked.map(shortUuid).join('+') + ' (subscribed before the hang)' };
-    }
-    if (this._goodSubscribeOrder && this._goodSubscribeOrder.length) {
-      return { n: n, rotate: 0, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: false, name: 'known-good order (both subscribed)' };
-    }
-    if (n === 0) return { n: 0, rotate: 1, subscribeAll: true, timeout: T, writeFirst: false, pairing: false, name: 'ffea then fff1 (both subscribed, RX expected on fff1)' };
-    if (n === 1) return { n: 1, rotate: 0, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: true, name: 'rotated: fff1 first, longer timeout' };
-    if (n === 2) return { n: 2, rotate: 1, subscribeAll: true, timeout: T * 3, writeFirst: false, pairing: true, name: 'ffea then fff1 again, longest timeout' };
-    return { n: n, rotate: 1, subscribeAll: true, timeout: T * 2, writeFirst: true, pairing: true, name: 'write-first (ATZ is written before notifications are enabled)' };
+  function mkVariant(order, settle, diag, direct, writeFirst) {
+    return { id: order + '-s' + settle + (diag ? '-diag' : '-nodiag') + (direct ? '-direct' : '-enum') + (writeFirst ? '-writefirst' : ''), order: order, settle: settle, diag: diag, direct: direct, writeFirst: !!writeFirst };
+  }
+  var VARIANTS = [
+    mkVariant('ffea', 400, false, false),
+    mkVariant('fff1', 1500, false, true),
+    mkVariant('ffea', 3000, true, false),
+    mkVariant('fff1', 1500, false, false),
+    mkVariant('ffea', 3000, false, true),
+    mkVariant('ffea', 1500, false, false, true),
+    mkVariant('fff1', 3000, false, true),
+    mkVariant('ffea', 400, true, false),
+    mkVariant('fff1', 3000, false, false),
+    mkVariant('ffea', 1500, false, true)
+  ];
+  var RECONNECT_WAITS = [1000, 1500, 2000, 3000];
+  var VARIANT_KEY = 'obd.bleVariant';
+
+  BleTransport.prototype._variantStore = function () {
+    if (this.opts.variantStore) return this.opts.variantStore;
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        var ls = window.localStorage;
+        return { get: function (k) { return ls.getItem(k); }, set: function (k, v) { ls.setItem(k, v); } };
+      }
+    } catch (e) { /* storage blocked */ }
+    return null;
+  };
+  BleTransport.prototype._loadWinner = function () { try { var st = this._variantStore(); return st ? st.get(VARIANT_KEY) : null; } catch (e) { return null; } };
+  BleTransport.prototype._saveWinner = function (id) { try { var st = this._variantStore(); if (st) st.set(VARIANT_KEY, id); } catch (e) { /* ignore */ } };
+
+  /** Variant order for this connect: the remembered winner first (if still in the table), then the table order. */
+  BleTransport.prototype._variantOrder = function () {
+    if (this._order) return this._order;
+    var table = this.opts.variantTable || VARIANTS;
+    var win = this._winnerId || this._loadWinner();
+    var first = win ? table.filter(function (v) { return v.id === win; })[0] : null;
+    this._order = first ? [first].concat(table.filter(function (v) { return v !== first; })) : table.slice();
+    return this._order;
   };
 
+  /** Connect plan for attempt n (0 = first try). After a partial success (one notify char subscribed, the other hung) the
+   *  next attempt puts the characteristic that worked first and keeps the other in reserve. */
+  BleTransport.prototype._planFor = function (n) {
+    var order = this._variantOrder(), v = order[n % order.length];
+    var T = this._opt('notifyTimeout', 4000);
+    var plan = { n: n, variant: v, rotate: v.order === 'ffea' ? 1 : 0, subscribeAll: true, timeout: T, writeFirst: v.writeFirst, pairing: n > 0,
+      settle: v.settle, diag: v.diag, direct: v.direct, name: v.id };
+    if (this._partialHang && this._partialHang.worked && this._partialHang.worked.length) {
+      var worked = this._partialHang.worked.slice();
+      this._partialHang = null;
+      plan.onlyUuids = worked; plan.subscribeAll = false;
+      plan.name = v.id + ' + ' + worked.map(shortUuid).join('+') + ' first (it subscribed before the hang)';
+    }
+    return plan;
+  };
+
+  BleTransport.prototype._cancelError = function () {
+    var e = new Error('Connect cancelled'); e.cancelled = true; e.noRecover = true; return e;
+  };
+  /** Stop a connect in progress: aborts the current wait/op and disconnects. Safe to call at any time. */
+  BleTransport.prototype.cancel = function () {
+    if (!this._cancelReject) return false;
+    this._cancelled = true; this._expectDisc = true;
+    var rej = this._cancelReject; this._cancelReject = null;
+    this.log('warn', 'Connect cancelled by user');
+    try { if (this.device && this.device.gatt) this.device.gatt.disconnect(); } catch (e) { /* ignore */ }
+    rej(this._cancelError());
+    return true;
+  };
+  BleTransport.prototype._sleepC = function (ms) { return this._cancelP ? Promise.race([sleep(ms), this._cancelP]) : sleep(ms); };
+
+  BleTransport.prototype._waitFor = function (n) {
+    var fixed = this.opts.reconnectWait;
+    return fixed != null ? fixed : RECONNECT_WAITS[Math.min(n - 1, RECONNECT_WAITS.length - 1)];
+  };
+
+  /**
+   * Persistent connect. Keeps reconnecting (up to maxAttempts, default 10, or totalBudget ms, default 90s) with the next
+   * variant each time; the first attempt that gets a subscription wins and is remembered. Cancel() aborts it.
+   */
   BleTransport.prototype.connect = function () {
     var self = this;
     if (!this.device) return Promise.reject(new Error('No device selected'));
     return this._exclusive(async function () {
-      var max = self._opt('maxRecoveries', 3);
-      self.log('info', 'Connecting GATT to ' + self.name + ' (' + (self.device.id || '') + ')');
-      try { await self._setup(self._planFor(0)); }
-      catch (e) {
-        if (e.noRecover || e.fatal) throw e;
-        self.log('warn', 'GATT setup failed: ' + e.message + ' -> reconnecting (up to ' + max + ' times)');
-        var ok = await self._recoverLoop(e.message, max, 1);
-        if (!ok) {
-          self._dead = true;
-          throw fatalError('Could not establish a working Bluetooth GATT link after ' + max + ' reconnect attempts (' + (self._lastErr || e.message) + '). ' + HELP_TEXT, e);
+      var max = self._opt('maxAttempts', 10), budget = self._opt('totalBudget', 90000);
+      self._cancelled = false; self._order = null; self._partialHang = null; self._dead = false;
+      self._cancelP = new Promise(function (resolve, reject) { self._cancelReject = reject; });
+      self._cancelP.catch(noop);
+      var t0 = Date.now(), lastErr = null, stored = self._loadWinner();
+      self.log('info', 'Connecting GATT to ' + self.name + ' (' + (self.device.id || '') + '): up to ' + max + ' attempts / ~' + Math.round(budget / 1000) + 's, Cancel stops it' +
+        (stored ? '; remembered winning variant "' + stored + '" is tried first' : ''));
+      try {
+        for (var n = 0; n < max; n++) {
+          if (self._cancelled) throw self._cancelError();
+          if (n > 0 && Date.now() - t0 > budget) { self.log('warn', 'Connect time budget (' + budget + 'ms) used up after ' + n + ' attempts'); break; }
+          var plan = self._planFor(n), tag = 'Attempt ' + (n + 1) + '/' + max;
+          self.attempt = { n: n + 1, max: max, variant: plan.variant.id };
+          self.onStatus('Connecting… attempt ' + (n + 1) + '/' + max + ' (' + plan.variant.id + ')');
+          if (n > 0) {
+            var wait = self._waitFor(n);
+            self.stats.recoveries++;
+            self._recovering = true; self._expectDisc = true;
+            self.log('warn', tag + ': disconnect, wait ' + wait + 'ms so the dongle\'s BLE stack can reset, then reconnect');
+            try { if (self.device && self.device.gatt) self.device.gatt.disconnect(); } catch (e) { /* ignore */ }
+            self._poisoned = false;
+            await self._sleepC(wait);
+          }
+          var ta = Date.now();
+          self.log('info', tag + ' variant "' + plan.variant.id + '": order ' + plan.variant.order + ' first, settle ' + (self.opts.postConnectDelay != null ? self.opts.postConnectDelay : plan.settle) + 'ms, discovery ' + (plan.direct ? 'direct getPrimaryService(fff0)' : 'getPrimaryServices()') +
+            ', diagnostics ' + (plan.diag ? 'on' : 'off') + (plan.writeFirst ? ', write-first' : '') + ', hang timeout ' + plan.timeout + 'ms');
+          try {
+            await self._setup(plan);
+            self._recovering = false; self._expectDisc = false;
+            self._winnerId = plan.variant.id; self._order = null; self._saveWinner(plan.variant.id);
+            self.log('info', tag + ' OK in ' + (Date.now() - ta) + 'ms (' + (Date.now() - t0) + 'ms total); remembered variant "' + plan.variant.id + '" as the winner');
+            return true;
+          } catch (e) {
+            if (e.cancelled || e.noRecover || e.fatal) throw e;
+            lastErr = e.message; self._lastErr = e.message;
+            self.log('warn', tag + ' FAILED after ' + (Date.now() - ta) + 'ms: ' + e.message);
+          }
         }
-      }
-      return true;
+        self._dead = true; self._poisoned = true; self._recovering = false; self._expectDisc = true;
+        try { if (self.device && self.device.gatt) self.device.gatt.disconnect(); } catch (e) { /* ignore */ }
+        throw fatalError('Could not establish a working Bluetooth GATT link after ' + (self.attempt ? self.attempt.n : max) + ' attempts / ' + Math.round((Date.now() - t0) / 1000) + 's (' + lastErr + '). ' + HELP_TEXT);
+      } catch (e) {
+        self._recovering = false;
+        if (e.cancelled) { self._expectDisc = true; try { if (self.device && self.device.gatt) self.device.gatt.disconnect(); } catch (x) { /* ignore */ } }
+        throw e;
+      } finally { self._cancelP = null; self._cancelReject = null; }
     });
   };
 
-  /** disconnect -> wait -> connect -> rediscover -> resubscribe, each try with the next connect plan. Call inside _exclusive. */
+  /** Mid-session recovery (a write or fallback hung): disconnect -> wait -> reconnect -> rediscover -> resubscribe with the winning variant first. */
   BleTransport.prototype._recoverLoop = async function (reason, maxTries, firstPlan) {
     var wait = this._opt('reconnectWait', 1000);
     for (var i = 1; i <= maxTries; i++) {
-      var plan = this._planFor((firstPlan || 1) + i - 1);
+      var plan = this._planFor((firstPlan == null ? 0 : firstPlan) + i - 1);
       this.stats.recoveries++;
       this._recovering = true; this._expectDisc = true;
       this.onStatus('Reconnecting Bluetooth (' + i + '/' + maxTries + ')…');
-      this.log('warn', 'Recovery ' + i + '/' + maxTries + ' (' + reason + '): disconnect, wait ' + wait + 'ms, reconnect, rediscover. Plan: ' + plan.name + ', notify timeout ' + plan.timeout + 'ms');
+      this.log('warn', 'Recovery ' + i + '/' + maxTries + ' (' + reason + '): disconnect, wait ' + wait + 'ms, reconnect, rediscover. Variant: ' + plan.name + ', notify timeout ' + plan.timeout + 'ms');
       try { if (this.device && this.device.gatt) this.device.gatt.disconnect(); } catch (e) { /* ignore */ }
       this._poisoned = false;
       await sleep(wait);
@@ -227,6 +328,7 @@
   BleTransport.prototype._setup = async function (plan) {
     var self = this;
     plan = plan || this._planFor(0);
+    this._lastPlan = plan;
     this.subscribed = []; this.altNotify = []; this.notifyChars = []; this.writeChar = null;
     // A previous page (pull-to-refresh) or a failed reconnect may have left the device "connected".
     // startNotifications into a stale link hangs, so drop it and wait before a clean setup.
@@ -234,13 +336,23 @@
       this.log('info', 'GATT already connected; disconnecting and waiting before a clean setup');
       this._expectDisc = true;
       try { this.device.gatt.disconnect(); } catch (e) { /* ignore */ }
-      await sleep(this._opt('reconnectWait', 1000));
+      await this._sleepC(this._waitFor(1));
       this._expectDisc = false;
     }
     this.server = await this._runOp('gatt.connect', function () { return self.device.gatt.connect(); }, { timeout: this._opt('gattTimeout', 15000) });
-    var d1 = this._opt('postConnectDelay', 400);
-    if (d1) { this.log('info', 'Waiting ' + d1 + 'ms after connect before first GATT operation'); await sleep(d1); }
-    var services = await this._runOp('getPrimaryServices', function () { return self.server.getPrimaryServices(); });
+    var d1 = this.opts.postConnectDelay != null ? this.opts.postConnectDelay : (plan.settle != null ? plan.settle : 400);
+    if (d1) { this.log('info', 'Settle: waiting ' + d1 + 'ms after connect before the first GATT operation'); await this._sleepC(d1); }
+    var services = null;
+    if (plan.direct && typeof this.server.getPrimaryService === 'function') {
+      try {
+        var svc = await this._runOp('getPrimaryService fff0 (direct)', function () { return self.server.getPrimaryService(uuid16('fff0')); });
+        services = [svc];
+      } catch (e) {
+        if (e.timeout || e.busy || e.cancelled) throw e;
+        this.log('info', 'Direct getPrimaryService(fff0) failed (' + (e.name || '') + ' ' + e.message + '); using getPrimaryServices() instead');
+      }
+    }
+    if (!services) services = await this._runOp('getPrimaryServices', function () { return self.server.getPrimaryServices(); });
     this.log('info', 'Services visible: ' + services.map(function (s) { return s.uuid; }).join(', '));
     var found = await this._pickCharacteristics(services);
     if (!found) { var ne = new Error('No notify+write characteristic pair found. Check Console for the service list.'); ne.noRecover = true; throw ne; }
@@ -254,21 +366,14 @@
       else this.log('warn', 'Settings asked for notify ' + want + ' but it is not in this service; using auto');
     }
     if (!this.notifyLocked) {
-      // Prefer a previously successful full subscribe order (ffea then fff1). Never promote the
-      // RX characteristic (fff1) to first — that hung startNotifications on this dongle.
-      if (this._goodSubscribeOrder && this._goodSubscribeOrder.length) {
-        var byU = {};
-        list.forEach(function (c) { byU[c.uuid] = c; });
-        var ordered = [];
-        this._goodSubscribeOrder.forEach(function (u) { if (byU[u]) { ordered.push(byU[u]); delete byU[u]; } });
-        list.forEach(function (c) { if (byU[c.uuid]) ordered.push(c); });
-        list = ordered;
-      } else if (plan.onlyUuids && plan.onlyUuids.length) {
-        var wantU = plan.onlyUuids;
-        list = wantU.map(function (u) { return list.filter(function (c) { return c.uuid === u; })[0]; }).filter(Boolean);
-      } else if (plan.rotate && list.length > 1) {
+      if (plan.rotate && list.length > 1) {
         var r = plan.rotate % list.length;
         list = list.slice(r).concat(list.slice(0, r));
+      }
+      if (plan.onlyUuids && plan.onlyUuids.length) {
+        // a characteristic that subscribed before the previous hang goes first; the rest stay in reserve (init subscribes them if no RX)
+        var firstUs = plan.onlyUuids.map(function (u) { return list.filter(function (c) { return c.uuid === u; })[0]; }).filter(Boolean);
+        list = firstUs.concat(list.filter(function (c) { return firstUs.indexOf(c) < 0; }));
       }
     }
     this.notifyChars = list;
@@ -322,8 +427,6 @@
     this.altNotify = list.filter(function (c) { return this.subscribed.indexOf(c) < 0; }, this);
     if (this.altNotify.length && !this.notifyLocked)
       this.log('info', 'Alternate notify characteristic(s) held in reserve (used only if no RX arrives): ' + this.altNotify.map(function (c) { return shortUuid(c.uuid); }).join(', '));
-    if (this.subscribed.length === list.length && list.length > 1)
-      this._goodSubscribeOrder = this.subscribed.map(function (c) { return c.uuid; });
   };
 
   BleTransport.prototype._attachListener = function (char) {
@@ -364,8 +467,10 @@
     var self = this, id = shortUuid(char.uuid);
     var kind = char.properties.notify ? 'notify' : (char.properties.indicate ? 'indicate' : 'notify');
     this._attachListener(char);
-    var timeout = plan ? plan.timeout : this._opt('notifyTimeout', 5000) * 2;
-    if (this.opts.diagnostics !== false) await this._diagnose(char);
+    var timeout = plan ? plan.timeout : this._opt('notifyTimeout', 4000);
+    var diagOn = plan ? plan.diag !== false : (this._lastPlan ? this._lastPlan.diag !== false : true);
+    if (this.opts.diagnostics !== false && diagOn) await this._diagnose(char);
+    else if (plan && !plan.diag) this.log('info', '  (skipping getDescriptors/getDescriptor(0x2902) diagnostics on this attempt)');
     var tries = retry ? 2 : 1;
     for (var n = 1; n <= tries; n++) {
       if (plan && plan.pairing) {
@@ -489,7 +594,7 @@
           self.log('warn', 'Write failed (' + self.writeModeLabel() + '): ' + e.message);
           if (attempt > maxRec) { self._dead = true; throw fatalError('Bluetooth write failed and ' + maxRec + ' reconnect attempts did not fix it (' + e.message + ').', e); }
           if (!self.rxSeen && !e.busy && self.canToggleWrite()) { self.toggleWriteMode(); self.log('info', 'No RX has ever arrived, so after reconnect the other write mode will be used (once, not per command)'); }
-          await self._recoverLoop(e.message, 1, 1);
+          await self._recoverLoop(e.message, 1, 0);
         }
       }
     });
@@ -503,7 +608,7 @@
     var self = this;
     return this._exclusive(async function () {
       if (self._dead) return null;
-      if (self._poisoned) { try { await self._recoverLoop('poisoned before fallback', 1, 1); } catch (e) { return null; } }
+      if (self._poisoned) { try { await self._recoverLoop('poisoned before fallback', 1, 0); } catch (e) { return null; } }
       if (!self.notifyLocked && self.altNotify.length) {
         var c = self.altNotify.shift();
         try {
@@ -811,7 +916,7 @@
     q.forEach(function (j) { j.reject(reason || new Error('CANCELLED')); });
   };
 
-  var api = { BleTransport: BleTransport, MockTransport: MockTransport, ElmSession: ElmSession, BLE_PROFILES: BLE_PROFILES, OPTIONAL_SERVICES: OPTIONAL_SERVICES, withTimeout: withTimeout, formatBytes: formatBytes, shortUuid: shortUuid, uuid16: uuid16, isBusyError: isBusyError };
+  var api = { BleTransport: BleTransport, MockTransport: MockTransport, ElmSession: ElmSession, BLE_PROFILES: BLE_PROFILES, OPTIONAL_SERVICES: OPTIONAL_SERVICES, withTimeout: withTimeout, VARIANTS: VARIANTS, formatBytes: formatBytes, shortUuid: shortUuid, uuid16: uuid16, isBusyError: isBusyError };
 
   if (isNode) module.exports = api; else root.Transport = api;
 })(this);
