@@ -29,7 +29,7 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.goto(url, { waitUntil: 'networkidle0' });
   check(await page.$('#btn-connect') !== null, 'page loads');
   const ver = await page.$eval('#app-ver', e => e.textContent);
-  check(ver === 'v1.5', 'visible version is v1.5, got ' + ver);
+  check(ver === 'v1.6', 'visible version is v1.6, got ' + ver);
   await page.screenshot({ path: path.join(shots, '1-connect.png') });
 
   await page.click('#btn-mock');
@@ -44,11 +44,27 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.click('.tabs [data-view=live]');
   await page.click('#btn-live');
   await wait(2500);
-  const rpm = await page.$eval('#tile-0C .val', e => e.textContent);
+  const tileVal = async (id) => page.$eval('#tile-' + id + ' .val', e => e.textContent);
+  const rpm = await tileVal('0C');
   check(rpm !== '--' && +rpm > 300, 'live RPM tile updates: ' + rpm);
+  for (const id of ['0C', '0D', '05', '04', '42', '11']) {
+    const v = await tileVal(id);
+    check(v !== '--' && v !== '' && !isNaN(parseFloat(v)), 'Quick look tile ' + id + ' has a value: ' + v);
+  }
   const rate = parseFloat(await page.$eval('#st-rate', e => e.textContent));
   check(rate > 1, 'live rate ' + rate + ' Hz');
   await page.screenshot({ path: path.join(shots, '3-live.png') });
+
+  // Mid-live profile switch must rebuild the poll list (v1.6: was stuck on the start-live PID set)
+  await page.select('#live-profile', 'preset-air');
+  await wait(2500);
+  for (const id of ['10', '0B', '0F', '33', '11', '0C', '04']) {
+    const v = await tileVal(id);
+    check(v !== '--' && v !== '' && !isNaN(parseFloat(v)), 'Air intake tile ' + id + ' after mid-live switch: ' + v);
+  }
+  const switched = await page.evaluate(() => (window.__livePids ? window.__livePids().join(',') : ''));
+  check(switched === '10,0B,0F,33,11,0C,04', 'livePids rebuilt after switch: ' + switched);
+  await page.screenshot({ path: path.join(shots, '3b-live-air.png') });
 
   // Record
   await page.click('#btn-rec');
@@ -67,11 +83,19 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.screenshot({ path: path.join(shots, '4-session.png'), fullPage: true });
   const csv = await page.evaluate(async () => {
     const list = await Store.listSessions(); const rows = await Store.getRows(list[0].id);
-    return window.__buildCsv(list[0], rows, 'imperial');
+    return { csv: window.__buildCsv(list[0], rows, 'imperial'), pids: list[0].pids, keys: Object.keys((rows[0] && rows[0].v) || {}) };
   });
-  const lines = csv.split('\r\n');
-  check(lines[0].startsWith('timestamp,elapsed_s,Engine RPM (rpm)'), 'CSV header: ' + lines[0].slice(0, 80));
+  const lines = csv.csv.split('\r\n');
+  check(lines[0].startsWith('timestamp,elapsed_s'), 'CSV header: ' + lines[0].slice(0, 120));
   check(lines.length > 5, 'CSV rows: ' + (lines.length - 1));
+  // Recording happens after the mid-live switch to Air intake, so every air-intake PID must appear with a value
+  for (const id of ['10', '0B', '0F', '33', '11', '0C', '04']) {
+    check(csv.pids.includes(id), 'recorded meta.pids includes ' + id + ': ' + csv.pids.join(','));
+    check(lines[0].includes('[01' + id + ']'), 'CSV header has 01' + id);
+    const col = lines[0].split(',').findIndex(h => h.includes('[01' + id + ']'));
+    const filled = lines.slice(1).filter(l => l && l.split(',')[col] !== '');
+    check(filled.length > 0, 'CSV has values for PID ' + id + ' in ' + filled.length + ' rows');
+  }
 
   // Codes
   await page.click('.tabs [data-view=codes]');
@@ -103,8 +127,11 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 
   // Console
   await page.click('.tabs [data-view=console]');
-  await page.type('#con-input', 'ATI'); await page.click('#con-send');
-  await wait(600);
+  await page.click('#con-clear');
+  await page.click('#con-input', { clickCount: 3 });
+  await page.type('#con-input', 'ATI');
+  await page.click('#con-send');
+  await page.waitForFunction(() => (document.querySelector('#console') || {}).textContent.includes('ELM327'), { timeout: 8000 });
   const con = await page.$eval('#console', e => e.textContent);
   check(con.includes('ELM327 v1.5'), 'console shows raw traffic');
   await page.screenshot({ path: path.join(shots, '7-console.png') });

@@ -256,3 +256,72 @@ test('v1.4: mitsubishi mock fixtures (39 PIDs, VIN, pending P0420, MIL off) and 
   assert.ok(obd.multiPid, 'multi-PID should stay on when the mock returns a valid ISO-TP reply');
   assert.ok(logs.some(l => /Live 010C0D05044211 -> /.test(l)));
 });
+
+test('v1.6: exact hardware single-PID live replies (with fast-response "1" suffix) all decode', () => {
+  const cases = [
+    ['010C1', '410C0B0C\r\r>', '0C', 707],
+    ['010C1', '410C0ADD\r\r>', '0C', 695.25],
+    ['010C1', '410C0B1B\r\r>', '0C', 710.75],
+    ['01151', '41151C80\r\r>', '15', 0.14],
+    ['01151', '41151C81\r\r>', '15', 0.14],
+    ['01061', '410680\r\r>', '06', 0],
+    ['01061', '410681\r\r>', '06', 0.78125],
+    ['01071', '410781\r\r>', '07', 0.78125]
+  ];
+  for (const [cmd, raw, pid, want] of cases) {
+    const parsed = ELM.parsePidResponse(raw, 1, PIDS.length, cmd);
+    assert.ok(parsed[pid], cmd + ' ' + raw + ' -> ' + JSON.stringify(parsed));
+    near(PIDS.decode(pid, parsed[pid]), want, 0.02);
+  }
+});
+
+test('v1.6: ElmSession reassembles a split 01151 reply (41151C8 + 1\\r\\r>) and queryPids returns it', async () => {
+  const sent = [];
+  const t = { write: async (s) => { sent.push(s); setTimeout(() => { t.onData('41151C8'); }, 5); setTimeout(() => { t.onData('1\r\r>'); }, 12); } };
+  const sess = new ElmSession(t, { timeout: 200 });
+  const raw = await sess.send('01151');
+  assert.equal(raw.replace(/\s/g, ''), '41151C81');
+  const parsed = ELM.parsePidResponse(raw, 1, PIDS.length, '01151');
+  near(PIDS.decode('15', parsed['15']), 0.14, 0.02);
+});
+
+test('v1.6: pollList keeps every supported Quick look and Air intake PID for this car (does not drop 0D/05/04/42/11/10/0B/0F/33)', () => {
+  const s00 = ELM.parsePidResponse('4100BE3FA813\r\r>', 1, PIDS.length, '0100')['00'];
+  const s20 = ELM.parsePidResponse('41209017E001\r\r>', 1, PIDS.length, '0120')['20'];
+  const s40 = ELM.parsePidResponse('4140FED00040\r\r>', 1, PIDS.length, '0140')['40'];
+  const supported = ELM.decodeSupported(s00, 0).concat(ELM.decodeSupported(s20, 0x20), ELM.decodeSupported(s40, 0x40)).map(n => ELM.toHex(n));
+  const quick = PIDS.PRESETS.find(p => p.id === 'preset-quick').pids;
+  const air = PIDS.PRESETS.find(p => p.id === 'preset-air').pids;
+  const cat = PIDS.PRESETS.find(p => p.id === 'preset-cat').pids;
+  assert.deepEqual(PIDS.pollList(quick, supported), quick);
+  assert.deepEqual(PIDS.pollList(air, supported), air);
+  // O2 / Catalyst: 14/18/19/3C/3E are not supported; 15/06/07/0C are
+  assert.deepEqual(PIDS.pollList(cat, supported), ['15', '06', '07', '0C']);
+  // A mid-live profile switch is just "call pollList again with the new profile"
+  let current = 'preset-cat';
+  const list = () => PIDS.pollList(PIDS.PRESETS.find(p => p.id === current).pids, supported);
+  assert.deepEqual(list(), ['15', '06', '07', '0C']);
+  current = 'preset-quick';
+  assert.deepEqual(list(), quick);
+  current = 'preset-air';
+  assert.deepEqual(list(), air);
+});
+
+test('v1.6: mitsubishi mock, single-PID + "1" suffix (as in the v1.5 log): every Quick look and Air intake PID gets a value', async () => {
+  const logs = [];
+  const mock = new MockTransport({ latency: 1, splitPrompt: true, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 400 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), pidTimeout: 300, multiPid: false, fastResponse: true });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+  const sup = await obd.readSupported();
+  const quick = PIDS.pollList(PIDS.PRESETS.find(p => p.id === 'preset-quick').pids, sup);
+  const air = PIDS.pollList(PIDS.PRESETS.find(p => p.id === 'preset-air').pids, sup);
+  const qv = await obd.queryPids(quick);
+  for (const p of quick) assert.equal(typeof qv[p], 'number', 'quick ' + p);
+  const av = await obd.queryPids(air);
+  for (const p of air) assert.equal(typeof av[p], 'number', 'air ' + p);
+  assert.ok(logs.some(l => /Live 010C1 -> /.test(l)));
+  assert.ok(logs.some(l => /Live 010D1 -> /.test(l) || /Live 0105 1/.test(l) || /Live 01051 -> /.test(l)));
+});
