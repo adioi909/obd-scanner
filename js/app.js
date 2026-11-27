@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.6';
+  var APP_VERSION = 'v1.6.1';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -541,13 +541,17 @@
     var el = $('#freeze'); el.classList.remove('hidden'); el.innerHTML = 'Reading freeze frame…';
     var ff = null;
     try { ff = await state.obd.readFreezeFrame(); } catch (e) { log('warn', e.message); }
-    if (!ff || !ff.dtc) el.innerHTML = '<h2>Freeze frame</h2><div class="empty">No freeze frame stored.</div>';
-    else {
+    if (!ff || !ff.dtc) {
+      el.innerHTML = '<h2>Freeze frame</h2><div class="empty">No freeze frame stored (normal when there are only pending codes).</div>' +
+        '<p class="hint">A freeze frame is a snapshot of sensor values at the moment a code is <b>confirmed and stored</b> (mode 03). Pending codes (mode 07) usually do not have one. Scroll here if you just tapped Freeze frame — the result is in this card, under the code lists.</p>';
+      toast('No freeze frame stored (normal when there are only pending codes)', 5000);
+    } else {
       el.innerHTML = '<h2>Freeze frame · ' + esc(ff.dtc) + '</h2><table class="ff">' + Object.keys(ff.values).map(function (pid) {
         var d = PIDS.get(pid); var disp = PIDS.toDisplay(pid, ff.values[pid], settings.units);
         return '<tr><td>' + esc(d.name) + '</td><td>' + PIDS.format(disp.value, disp.unit) + ' ' + esc(disp.unit) + '</td></tr>';
       }).join('') + '</table>';
     }
+    try { el.scrollIntoView({ behavior: 'auto', block: 'start' }); } catch (e) { /* ignore */ }
     if (resume) startLive();
   };
 
