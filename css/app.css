@@ -68,3 +68,7 @@ dialog::backdrop { background:rgba(0,0,0,.65); }
 
 .help-link { margin-left:10px; font-size:13px; font-weight:600; color:var(--blue); text-decoration:none; letter-spacing:0; }
 .help-link:active { opacity:.7; }
+
+.banner { position:sticky; top:52px; z-index:4; display:flex; gap:10px; align-items:center; justify-content:space-between; margin:8px 10px 0; padding:10px 12px; border-radius:12px; background:#2b2106; border:1px solid #9e6a03; color:#ffd36e; font-size:14px; }
+.banner .btn { flex:none; }
+.tile.exp .lbl { color:#d2a8ff; }

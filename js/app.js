@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.6.1';
+  var APP_VERSION = 'v1.7.0';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -43,6 +43,7 @@
       var d = $('#dlg'); $('#dlg-title').textContent = title; $('#dlg-body').textContent = body; $('#dlg-ok').textContent = okText || 'OK';
       d.onclose = function () { resolve(d.returnValue === 'ok'); };
       d.returnValue = ''; d.showModal();
+      var c = d.querySelector('button[value=cancel]'); if (c) c.focus(); // Cancel is the default action
     });
   }
   function setStatus(cls, text) { var s = $('#status'); s.className = 'pill ' + cls; s.textContent = text; }
@@ -139,6 +140,7 @@
     var o = state.obd;
     setStatus('busy', 'Initializing ELM…');
     var info = await o.init(settings.protocol);
+    showDirty(false);
     $('#i-elm').textContent = info.elm || '--';
     $('#i-volt').textContent = info.voltage || '--';
     if (!info.adapterOk) {
@@ -223,8 +225,9 @@
     sel.innerHTML = profiles.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + ' (' + p.pids.length + ')</option>'; }).join('');
     var a = activeProfile(); if (a) sel.value = a.id;
   }
+  function enhNS() { return (state.obd && state.obd.enhancedNS) || {}; }
   function livePids() {
-    return PIDS.pollList((activeProfile() || { pids: [] }).pids, state.supported);
+    return PIDS.pollList((activeProfile() || { pids: [] }).pids, state.supported, enhNS());
   }
   $('#live-profile').addEventListener('change', function (e) {
     settings.activeProfile = e.target.value; Store.saveSettings(settings); renderTiles();
@@ -267,13 +270,13 @@
         '<label class="row">Only show PIDs this car supports' + (state.supported ? '' : ' (connect first)') + '<input type="checkbox" id="pe-only" ' + (onlySup ? 'checked' : '') + (state.supported ? '' : ' disabled') + '></label>' +
         '<div class="meta" id="pe-count">' + chosen.length + ' selected</div>';
       PIDS.CATEGORIES.forEach(function (cat) {
-        var defs = PIDS.DEFS.filter(function (d) { return d.cat === cat; });
-        if (onlySup && state.supported) defs = defs.filter(function (d) { return state.supported.indexOf(d.pid) >= 0 || chosen.indexOf(d.pid) >= 0; });
+        var defs = PIDS.ALL.filter(function (d) { return d.cat === cat; });
+        if (onlySup && state.supported) defs = defs.filter(function (d) { return PIDS.isSupported(d.pid, state.supported, enhNS()) || chosen.indexOf(d.pid) >= 0; });
         if (!defs.length) return;
         html += '<div class="pid-group"><h4>' + esc(cat) + '</h4>' + defs.map(function (d) {
-          var sup = state.supported ? state.supported.indexOf(d.pid) >= 0 : null;
+          var sup = state.supported ? (d.enhanced ? (enhNS()[d.pid] ? false : null) : state.supported.indexOf(d.pid) >= 0) : null;
           return '<label class="pid-opt' + (sup === false ? ' unsup' : '') + '"><input type="checkbox" data-pid="' + d.pid + '" ' + (chosen.indexOf(d.pid) >= 0 ? 'checked' : '') + '>' +
-            '<span class="nm">' + esc(d.name) + ' <span class="pidc">01' + d.pid + '</span></span>' + (sup ? '<span class="badge">car ✓</span>' : '') + '</label>';
+            '<span class="nm">' + esc(d.name) + ' <span class="pidc">' + esc(PIDS.code(d.pid)) + '</span>' + (d.enhanced ? ' <span class="pidc">read-only, experimental</span>' : '') + '</span>' + (sup ? '<span class="badge">car ✓</span>' : '') + '</label>';
         }).join('') + '</div>';
       });
       html += '<div class="btn-row" style="position:sticky;bottom:72px;background:var(--card);padding:8px 0"><button class="btn big grow" id="pe-cancel">Cancel</button><button class="btn primary big grow" id="pe-save">Save</button></div>';
@@ -310,12 +313,18 @@
     if (!p) { el.innerHTML = '<div class="empty">Create a profile first.</div>'; return; }
     el.innerHTML = p.pids.map(function (pid) {
       var d = PIDS.get(pid); if (!d) return '';
-      var unsup = state.supported && state.supported.indexOf(pid) < 0;
-      return '<div class="tile" id="tile-' + pid + '"' + (unsup ? ' style="opacity:.5"' : '') + '><div class="lbl">' + esc(d.short) + (unsup ? ' (n/s)' : '') + '</div>' +
+      var unsup = d.enhanced ? !!enhNS()[pid] : (state.supported && state.supported.indexOf(pid) < 0);
+      return '<div class="tile' + (d.experimental ? ' exp' : '') + '" id="tile-' + pid + '"' + (unsup ? ' style="opacity:.5"' : '') + '><div class="lbl">' + esc(d.short) + (unsup ? ' (n/s)' : '') + '</div>' +
         '<div><span class="val">--</span><span class="unit">' + esc(PIDS.unitFor(pid, settings.units)) + '</span></div>' +
         '<div class="bar"><i></i></div><div class="mm"><span class="mn">min --</span><span class="mx">max --</span></div></div>';
     }).join('');
     tileStats = {};
+  }
+  function markTileNS(pid) {
+    var el = document.getElementById('tile-' + pid); if (!el || el.dataset.ns) return;
+    el.dataset.ns = '1'; el.style.opacity = '.5';
+    var l = el.querySelector('.lbl'); if (l && l.textContent.indexOf('(n/s)') < 0) l.textContent += ' (n/s)';
+    el.querySelector('.val').textContent = 'N/S';
   }
   function updateTiles(values) {
     Object.keys(values).forEach(function (pid) {
@@ -338,7 +347,35 @@
       if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
     } catch (e) { /* ignore */ }
   }
-  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible' && state.live) keepAwake(true); });
+  // v1.7.0: Chrome drops the wake lock whenever the tab is hidden or the screen locks, and throttles timers in the
+  // background. On return: re-acquire the lock, abandon a stale in-flight command, note the gap, keep polling.
+  var bg = { hiddenAt: null };
+  function onHidden() {
+    bg.hiddenAt = Date.now();
+    if (state.recording) flush('hidden');
+  }
+  function onVisible() {
+    var now = Date.now();
+    if (state.live || state.recording) { wakeLock = null; keepAwake(true); }
+    var since = bg.hiddenAt; bg.hiddenAt = null;
+    if (!since || !state.live) return;
+    var stalled = state.lastCycleAt ? now - state.lastCycleAt : now - since;
+    var gap = Math.max(now - since, stalled);
+    if (gap < 2000) return;
+    var secs = Math.round(gap / 100) / 10;
+    log('warn', '[BACKGROUND GAP: ' + secs + 's] app was in the background; polling was paused or throttled by Chrome');
+    if (state.recording) {
+      var m = state.recording.meta; m.gaps = m.gaps || [];
+      m.gaps.push({ start: since, end: now, seconds: secs });
+    }
+    // A command sent just before the tab was hidden may never see its prompt in time: drop it so the queue moves on.
+    if (state.session && state.session.abortPending('BACKGROUND')) log('info', 'Cancelled the stale in-flight command; resuming live polling');
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') onHidden(); else onVisible();
+  });
+  window.addEventListener('pagehide', function () { if (state.recording) flush('pagehide'); });
+  window.__bg = { onHidden: onHidden, onVisible: onVisible, state: bg }; // for tests
 
   var liveLoop = null;
   async function startLive() {
@@ -350,12 +387,18 @@
     var cycles = 0, t0 = Date.now(), recent = [], lastKey = '';
     liveLoop = (async function () {
       while (state.live && state.connected) {
+        if (state.obd.adapter.dirty) {
+          try { if (await state.obd.resync()) { showDirty(false); toast('Adapter settings re-synced before live polling', 3000); } }
+          catch (e) { if (e.message === 'CANCELLED') break; log('warn', 'Re-sync failed: ' + e.message); await sleep(500); continue; }
+        }
         var pids = livePids(), key = pids.join(',');
         if (key !== lastKey) { log('info', 'Live poll list: ' + (key || '(empty)')); lastKey = key; }
         if (!pids.length) { await sleep(200); continue; }
         var vals;
         try { vals = await state.obd.queryPids(pids); } catch (e) { if (e.message === 'CANCELLED') break; log('warn', e.message); await sleep(300); continue; }
         var now = Date.now();
+        state.lastCycleAt = now;
+        ((activeProfile() || { pids: [] }).pids).forEach(function (p) { if (enhNS()[p]) markTileNS(p); });
         cycles++; recent.push(now); while (recent.length && now - recent[0] > 5000) recent.shift();
         updateTiles(vals);
         if (state.recording) recordRow(now, vals);
@@ -373,6 +416,8 @@
     if (!state.live) return;
     state.live = false; $('#btn-live').textContent = 'Start live'; keepAwake(false);
     if (liveLoop) { try { await liveLoop; } catch (e) { /* ignore */ } liveLoop = null; }
+    // Never leave the adapter pointed at another module (e.g. ATSH 7E1) after live stops.
+    if (state.connected && state.obd) { try { await state.obd.restoreDefaultHeader(); } catch (e) { log('warn', 'Header restore after live failed: ' + e.message); } }
   }
   $('#btn-live').onclick = function () { state.live ? stopLive() : startLive(); };
 
@@ -382,7 +427,10 @@
     var p = activeProfile(); if (!p) return;
     var meta = { id: 's-' + Date.now(), name: p.name + ' ' + new Date().toLocaleString(), profile: p.name, pids: livePids().slice(), start: Date.now(), end: null, samples: 0, vin: state.vin || null, adapter: state.transport.kind };
     await Store.putSession(meta);
-    state.recording = { meta: meta, buf: [], flushTimer: setInterval(flush, 2000) };
+    var rb = Store.createRowBuffer({ maxRows: 25, intervalMs: 3000,
+      onError: function (e) { log('warn', 'Save failed (will retry): ' + (e && e.message)); },
+      onFlushed: function () { if (state.recording && state.recording.meta === meta) { meta.end = Date.now(); Store.putSession(meta).catch(function () {}); } } });
+    state.recording = { meta: meta, rows: rb };
     $('#btn-rec').textContent = '■ Stop recording'; $('#btn-rec').classList.add('on');
     if (!state.live) await startLive();
     toast('Recording started');
@@ -393,16 +441,18 @@
       copy[k] = vals[k];
       if (r.meta.pids.indexOf(k) < 0) r.meta.pids.push(k);
     });
-    r.buf.push({ sid: r.meta.id, t: t, v: copy }); r.meta.samples++;
+    r.rows.push({ sid: r.meta.id, t: t, v: copy }); r.meta.samples++;
   }
-  async function flush() {
-    var r = state.recording; if (!r || !r.buf.length) return;
-    var rows = r.buf; r.buf = []; r.meta.end = Date.now();
-    try { await Store.addRows(rows); await Store.putSession(r.meta); } catch (e) { log('warn', 'Save failed: ' + e.message); }
+  /** Force-flush buffered rows (Stop, tab hidden, pagehide, beforeunload). */
+  function flush(reason) {
+    var r = state.recording; if (!r) return Promise.resolve();
+    r.meta.end = Date.now();
+    return r.rows.flush(reason).then(function () { return Store.putSession(r.meta); }).catch(function (e) { log('warn', 'Save failed: ' + e.message); });
   }
   async function stopRecording() {
     var r = state.recording; if (!r) return;
-    clearInterval(r.flushTimer); await flush(); r.meta.end = Date.now(); await Store.putSession(r.meta);
+    await r.rows.stop(); r.meta.end = Date.now(); await Store.putSession(r.meta);
+    if (r.meta.gaps && r.meta.gaps.length) log('info', 'Session had ' + r.meta.gaps.length + ' background gap(s): ' + r.meta.gaps.map(function (g) { return g.seconds + 's'; }).join(', '));
     state.recording = null;
     $('#btn-rec').textContent = '● Record'; $('#btn-rec').classList.remove('on');
     toast('Saved ' + r.meta.samples + ' samples to Logs');
@@ -441,14 +491,13 @@
     var xs = rows.map(function (r) { return (r.t - m.start) / 1000; });
     var html = '<div class="card"><div class="btn-row"><button class="btn small" id="sd-close">← Back</button><button class="btn small" id="sd-csv">Export CSV</button>' +
       (navigator.canShare ? '<button class="btn small" id="sd-share">Share</button>' : '') + '</div><h3 style="margin-top:10px">' + esc(m.name) + '</h3>' +
-      '<div class="meta">' + rows.length + ' samples · ' + fmtDur((m.end || m.start) - m.start) + (m.vin ? ' · VIN ' + esc(m.vin) : '') + '</div>';
+      '<div class="meta">' + rows.length + ' samples · ' + fmtDur((m.end || m.start) - m.start) + (m.vin ? ' · VIN ' + esc(m.vin) : '') + (m.gaps && m.gaps.length ? ' · ' + m.gaps.length + ' background gap(s): ' + m.gaps.map(function (g) { return g.seconds + 's'; }).join(', ') : '') + (rows.length > 1000 ? ' · charts downsampled for drawing (stats and CSV use all samples)' : '') + '</div>';
     m.pids.forEach(function (pid) {
       var d = PIDS.get(pid); if (!d) return;
       var ys = rows.map(function (r) { var v = r.v[pid]; return v == null ? null : PIDS.toDisplay(pid, v, settings.units).value; });
-      var valid = ys.filter(function (v) { return v != null; });
       var unit = PIDS.unitFor(pid, settings.units);
-      var mn = valid.length ? Math.min.apply(null, valid) : null, mx = valid.length ? Math.max.apply(null, valid) : null;
-      var avg = valid.length ? valid.reduce(function (a, b) { return a + b; }, 0) / valid.length : null;
+      var sm = Chart.summary(ys); // full data set, never the downsampled chart points
+      var mn = sm.min, mx = sm.max, avg = sm.avg;
       html += '<div class="chart-box"><div class="lbl"><b style="color:var(--text)">' + esc(d.name) + ' (' + esc(unit) + ')</b><span>min ' + PIDS.format(mn, unit) + ' · avg ' + PIDS.format(avg, unit) + ' · max ' + PIDS.format(mx, unit) + '</span></div><canvas data-chart="' + pid + '"></canvas></div>';
     });
     html += '</div>';
@@ -472,7 +521,7 @@
   }
   function buildCsv(meta, rows, units) {
     var pids = csvPids(meta, rows);
-    var head = ['timestamp', 'elapsed_s'].concat(pids.map(function (p) { var d = PIDS.get(p); return d.name + ' (' + PIDS.unitFor(p, units) + ') [01' + p + ']'; }));
+    var head = ['timestamp', 'elapsed_s'].concat(pids.map(function (p) { var d = PIDS.get(p); return d.name + ' (' + PIDS.unitFor(p, units) + ') [' + PIDS.code(p) + ']'; }));
     var q = function (s) { s = String(s); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
     var lines = [head.map(q).join(',')];
     rows.forEach(function (r) {
@@ -559,11 +608,35 @@
   var QUICK = ['ATI', 'ATRV', 'ATDPN', 'ATDP', '0100', '0101', '010C', '0105', '0902', '03', 'ATZ'];
   $('#con-quick').innerHTML = QUICK.map(function (c) { return '<button class="btn small mono" data-q="' + c + '">' + c + '</button>'; }).join('');
   $('#con-quick').querySelectorAll('[data-q]').forEach(function (b) { b.onclick = function () { sendManual(b.dataset.q); }; });
+  /** v1.7.0: interlock for write-capable commands (Mode 04 and UDS 10/11/27/2E/2F/31/34/36/37). Cancel is the default. */
+  function confirmWrite(cls) {
+    return confirmDlg('Send a write / control command?',
+      cls.cmd + ' is ' + cls.reason + '. It can change the vehicle: clear codes and readiness, reset or unlock a module, change coding, drive actuators or start reprogramming. ' +
+      'A wrong command can disable functions or brick a module. This app has no undo. Only send it if you know exactly what it does. Engine off, key on, battery healthy.',
+      'Send anyway');
+  }
+  function showDirty(on, cmds) {
+    var b = $('#dirty-banner'); if (!b) return;
+    if (on) { $('#dirty-cmds').textContent = (cmds || []).join(', '); b.classList.remove('hidden'); } else b.classList.add('hidden');
+  }
   async function sendManual(cmd) {
     cmd = (cmd || '').trim().toUpperCase(); if (!cmd) return;
     if (!requireConn()) return;
+    var cls = ELM.classifyCommand(cmd);
+    if (cls.write) {
+      log('warn', 'Console: ' + cls.cmd + ' is write-capable (' + cls.reason + '); asking for confirmation');
+      if (!(await confirmWrite(cls))) { log('info', 'Console: ' + cls.cmd + ' cancelled, nothing sent'); toast('Not sent'); return; }
+      log('warn', 'Console: user confirmed ' + cls.cmd);
+    }
     try { var r = await state.session.send(cmd, 8000); log('info', 'Response: ' + JSON.stringify(r)); } catch (e) { log('warn', cmd + ': ' + e.message); }
+    if (cls.atMutating && state.obd) {
+      ELM.markDirty(state.obd.adapter, cls.cmd);
+      log('warn', 'Console: ' + cls.cmd + ' changes adapter state; parser settings may no longer match. Re-run init, or Live will re-sync before polling.');
+      showDirty(true, state.obd.adapter.dirtyCmds);
+    }
   }
+  window.__sendManual = sendManual; // for tests
+  $('#btn-dirty-reinit').onclick = function () { if (state.connected) initElm(); };
   $('#con-send').onclick = function () { sendManual($('#con-input').value); $('#con-input').value = ''; };
   $('#con-input').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('#con-send').click(); });
   $('#con-clear').onclick = function () { logLines = []; scheduleConsole(); };
@@ -578,7 +651,7 @@
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function fmtDur(ms) { var s = Math.floor(ms / 1000); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = s % 60; return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(ss).padStart(2, '0'); }
 
-  window.addEventListener('beforeunload', function (e) { if (state.recording) { flush(); e.preventDefault(); e.returnValue = ''; } });
+  window.addEventListener('beforeunload', function (e) { if (state.recording) { flush('beforeunload'); e.preventDefault(); e.returnValue = ''; } });
   bindSettings(); renderProfileSelect(); renderTiles();
   if ($('#app-ver')) $('#app-ver').textContent = APP_VERSION;
   log('info', 'App loaded ' + APP_VERSION + '. Web Bluetooth ' + (Transport.BleTransport.isSupported() ? 'available' : 'NOT available'));
