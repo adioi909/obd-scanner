@@ -1,8 +1,13 @@
-# OBD Scanner (v1.5)
+# OBD Scanner (v1.6)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
+
+## v1.6 live gauges and profile switching
+v1.5 connected cleanly on the car, but live data only updated RPM. The poll loop captured the PID list once at "Start live" and never rebuilt it, so switching to Quick look or Air intake still polled the previous profile (the O2 / Catalyst supported subset: 0C, 15, 06, 07). Only RPM (0C) exists on those other screens, so every other tile stayed at "--". The replies themselves were fine (`410C0B0C`, `41151C80`, `410680`, `410781`, including one split `41151C8` + `1\r\r>`).
+
+v1.6 rebuilds the poll list on every cycle from the selected profile (filtered to supported PIDs), so a mid-live profile change takes effect on the next request. Record stores a copy of every decoded value and grows the session PID list as new ones appear; CSV columns are the union of the session PIDs and every key actually recorded.
 
 ## v1.5 persistent connect (intermittent first-op hang)
 On the real dongle (Realtek RTL8773BFR clone) the first GATT operation after discovery **hangs intermittently**, whichever characteristic is touched first (v1.3 got through on a later reconnect; v1.4 hung on ffea, fff1, ffea and a write in one run). A hung op wedges the whole link (even writes hang) until you disconnect, so channel order is not the fix. v1.5 instead keeps reconnecting and varies what it does:
