@@ -1,8 +1,15 @@
-# OBD Scanner (v1.3)
+# OBD Scanner (v1.4)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
+
+## v1.4 live data and a faster connect
+v1.3 connected on the real 2013 Mitsubishi (ELM327 v1.5, ISO 15765-4 CAN 11/500, 39 PIDs). The working BLE recipe is: subscribe **ffea first, then fff1**, and listen on **fff1** (writes go to fff2 with writeWithoutResponse). v1.4 does that on the first attempt instead of burning a 5s fff1 hang plus a 12s ATZ timeout on the wrong channel. Rotation and write-first stay as fallbacks. If a later subscribe hangs after an earlier one succeeded, the next reconnect retries only the characteristic that worked.
+
+Live gauges showed "--" while the read counter climbed at about 0.5 Hz. Multi-PID requests (for example `010C0D05044211`) were waiting until the 1500ms command timeout and then **skipping** the single-PID fallback, so every tile stayed empty. v1.4 always falls back to single-PID requests (and drops the fast-response `1` suffix if that is the problem) when a multi-PID reply times out, returns NO DATA/?, or does not decode, and it logs every live request/response (for example `Live 010C0D05044211 -> TIMEOUT (no RX)`). Init also sends `ATAL` so long ISO-TP replies are allowed.
+
+Pull-to-refresh is disabled (`overscroll-behavior: none`) so a swipe cannot reload the page and drop the GATT session. After an unexpected disconnect the previous GATT link is cleaned up and the app waits briefly before the next connect.
 
 ## v1.3 stuck-subscribe handling
 Some dongles hang `startNotifications` (the CCCD write, which can also trigger bonding). v1.3 rotates strategies across up to 3 reconnects: (0) fff1 first, 5s; (1) **ffea first**, 10s; (2) fff1 first, 15s; (3) **write-first**: attach listeners, write `ATZ`, then startNotifications. The UI status says "possible pairing prompt - check phone" while it waits. Before each subscribe it logs full characteristic properties, descriptors (is there a CCCD 2902?) and readValue if the characteristic is readable. "Forget and re-pick device" (Connect tab) drops the browser's saved device permission so the picker starts clean.
