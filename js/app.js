@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.5';
+  var APP_VERSION = 'v1.6';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -223,9 +223,18 @@
     sel.innerHTML = profiles.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name) + ' (' + p.pids.length + ')</option>'; }).join('');
     var a = activeProfile(); if (a) sel.value = a.id;
   }
+  function livePids() {
+    return PIDS.pollList((activeProfile() || { pids: [] }).pids, state.supported);
+  }
   $('#live-profile').addEventListener('change', function (e) {
-    if (state.recording) { toast('Stop recording before switching profile'); renderProfileSelect(); return; }
     settings.activeProfile = e.target.value; Store.saveSettings(settings); renderTiles();
+    var pids = livePids();
+    if (state.recording) {
+      pids.forEach(function (x) { if (state.recording.meta.pids.indexOf(x) < 0) state.recording.meta.pids.push(x); });
+      var p = activeProfile();
+      if (p && state.recording.meta.profile.indexOf(p.name) < 0) state.recording.meta.profile += ' + ' + p.name;
+    }
+    if (state.live) log('info', 'Live profile changed to ' + ((activeProfile() || {}).name || e.target.value) + '; next poll list: ' + (pids.join(',') || '(empty)'));
   });
 
   function renderProfiles() {
@@ -334,14 +343,16 @@
   var liveLoop = null;
   async function startLive() {
     if (!requireConn() || state.live) return;
-    var p = activeProfile(); if (!p || !p.pids.length) { toast('Pick a profile with PIDs'); return; }
-    var pids = p.pids.filter(function (x) { return PIDS.get(x) && (!state.supported || state.supported.indexOf(x) >= 0); });
-    if (!pids.length) { toast('This car supports none of the PIDs in this profile'); return; }
+    var pids0 = livePids();
+    if (!pids0.length) { toast('This car supports none of the PIDs in this profile'); return; }
     state.live = true; $('#btn-live').textContent = 'Stop live'; keepAwake(true);
-    log('info', 'Live start: ' + pids.join(',') + ' (raw request/response lines are always logged)');
-    var cycles = 0, t0 = Date.now(), recent = [];
+    log('info', 'Live start: ' + pids0.join(',') + ' (raw request/response lines are always logged; switching profile mid-live rebuilds this list)');
+    var cycles = 0, t0 = Date.now(), recent = [], lastKey = '';
     liveLoop = (async function () {
       while (state.live && state.connected) {
+        var pids = livePids(), key = pids.join(',');
+        if (key !== lastKey) { log('info', 'Live poll list: ' + (key || '(empty)')); lastKey = key; }
+        if (!pids.length) { await sleep(200); continue; }
         var vals;
         try { vals = await state.obd.queryPids(pids); } catch (e) { if (e.message === 'CANCELLED') break; log('warn', e.message); await sleep(300); continue; }
         var now = Date.now();
@@ -369,14 +380,21 @@
   async function startRecording() {
     if (!requireConn()) return;
     var p = activeProfile(); if (!p) return;
-    var meta = { id: 's-' + Date.now(), name: p.name + ' ' + new Date().toLocaleString(), profile: p.name, pids: p.pids.slice(), start: Date.now(), end: null, samples: 0, vin: state.vin || null, adapter: state.transport.kind };
+    var meta = { id: 's-' + Date.now(), name: p.name + ' ' + new Date().toLocaleString(), profile: p.name, pids: livePids().slice(), start: Date.now(), end: null, samples: 0, vin: state.vin || null, adapter: state.transport.kind };
     await Store.putSession(meta);
     state.recording = { meta: meta, buf: [], flushTimer: setInterval(flush, 2000) };
     $('#btn-rec').textContent = '■ Stop recording'; $('#btn-rec').classList.add('on');
     if (!state.live) await startLive();
     toast('Recording started');
   }
-  function recordRow(t, vals) { var r = state.recording; r.buf.push({ sid: r.meta.id, t: t, v: vals }); r.meta.samples++; }
+  function recordRow(t, vals) {
+    var r = state.recording, copy = {};
+    Object.keys(vals || {}).forEach(function (k) {
+      copy[k] = vals[k];
+      if (r.meta.pids.indexOf(k) < 0) r.meta.pids.push(k);
+    });
+    r.buf.push({ sid: r.meta.id, t: t, v: copy }); r.meta.samples++;
+  }
   async function flush() {
     var r = state.recording; if (!r || !r.buf.length) return;
     var rows = r.buf; r.buf = []; r.meta.end = Date.now();
@@ -445,8 +463,15 @@
     window.scrollTo(0, 0);
   }
 
+  function csvPids(meta, rows) {
+    var seen = {}, list = [];
+    function add(p) { if (PIDS.get(p) && !seen[p]) { seen[p] = true; list.push(p); } }
+    (meta.pids || []).forEach(add);
+    (rows || []).forEach(function (r) { Object.keys(r.v || {}).forEach(add); });
+    return list;
+  }
   function buildCsv(meta, rows, units) {
-    var pids = meta.pids.filter(function (p) { return PIDS.get(p); });
+    var pids = csvPids(meta, rows);
     var head = ['timestamp', 'elapsed_s'].concat(pids.map(function (p) { var d = PIDS.get(p); return d.name + ' (' + PIDS.unitFor(p, units) + ') [01' + p + ']'; }));
     var q = function (s) { s = String(s); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
     var lines = [head.map(q).join(',')];
@@ -457,7 +482,7 @@
     });
     return lines.join('\r\n');
   }
-  window.__buildCsv = buildCsv; // for tests
+  window.__buildCsv = buildCsv; window.__csvPids = csvPids; window.__livePids = livePids; // for tests
 
   async function exportCsv(sid, share) {
     var sd = await sessionData(sid);

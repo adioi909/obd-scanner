@@ -117,6 +117,13 @@
     return { value: metric == null ? null : imp.conv(metric), unit: imp.unit, min: imp.conv(d.min), max: imp.conv(d.max) };
   }
 
+  /** PIDs from a profile that we will actually poll: known to the library and, if given, reported as supported. */
+  function pollList(wanted, supported) {
+    return (wanted || []).filter(function (x) {
+      return get(x) && (!supported || supported.indexOf(x) >= 0);
+    });
+  }
+
   function unitFor(pid, system) { return toDisplay(pid, 0, system).unit; }
 
   function format(v, unit) {
@@ -138,6 +145,6 @@
     { id: 'preset-elec', name: 'Charging / electrical', pids: ['42', '0C', '04', '05'] }
   ];
 
-  var api = { DEFS: DEFS, CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, length: length, decode: decode, toDisplay: toDisplay, unitFor: unitFor, format: format };
+  var api = { DEFS: DEFS, CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.PIDS = api;
 })(this);
