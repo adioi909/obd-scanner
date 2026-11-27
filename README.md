@@ -1,13 +1,22 @@
-# OBD Scanner (v1.6.1)
+# OBD Scanner (v1.7.0)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
 **User manual and tips:** see [MANUAL.md](MANUAL.md) in this repo, or open **Help** in the app header
 (https://adioi909.github.io/obd-scanner/manual.html). A printable PDF is built as
-`OBD-Scanner-v1.6-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
+`OBD-Scanner-v1.7-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
 on the vehicle (the only UI write is Mode 04 clear codes / reset MIL, which also resets readiness
 monitors), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+
+## v1.7.0 safety, long drives, background recovery, enhanced PIDs
+- **Service worker hygiene:** precache is the app shell plus `manual.html` only; `.md`, `.pdf`, `.zip` and `GROK_BUILD_BRIEF.md` are never precached or runtime-cached. Cache `obd-scanner-v1.7.0`.
+- **Console interlock:** commands starting with `04`, `10`, `11`, `27`, `2E`, `2F`, `31`, `34`, `36`, `37` need an explicit confirm (Cancel is the default). `ELM.classifyCommand()` in `js/elm.js`.
+- **Dirty adapter state:** manual `ATZ/ATD/ATE/ATH/ATS/ATSP/ATSH/ATCAF/ATCRA` marks the adapter dirty (`ELM.markDirty`), shows a banner with Re-run init, and Live calls `Obd.resync()` before polling.
+- **Charts / storage:** `Chart.lttb()` downsamples sessions over 1,000 samples to 500-800 drawn points; `Chart.summary()` gives min/avg/max from the full data. `Store.createRowBuffer()` writes in batches (25 samples / 3 s) and force-flushes on stop, hidden, pagehide and beforeunload.
+- **Background:** on return to visible the wake lock is re-acquired; a stale in-flight command is dropped with `ElmSession.abortPending()` (and `clearQueue()` no longer leaves the pump stuck); `[BACKGROUND GAP: Xs]` is logged and stored in `meta.gaps`.
+- **Enhanced PIDs:** `PIDS.ENHANCED` entries carry `request`, `txHeader`, `rxFilter`, `byteIndex` and `decode(dataBytes)`. `Obd.queryPids` groups them by header, sends one request per header+request, only sends `ATSH`/`ATCRA` when the target changes (tracked in `obd.adapter`), always restores `ATSH7DF` + `ATCRA`, and marks a PID N/S after 3 consecutive failures. Experimental preset **Mitsubishi CVT (Experimental)**: `ATSH7E1`, `ATCRA7E9`, `2103`; N = data byte 13; main formula is the JF011E 5th-order polynomial, with N-55 and raw N alongside (sources and caveats in MANUAL.md section 17).
+- BLE connect/retry state machine unchanged.
 
 ## v1.6.1 freeze frame empty state and Help
 v1.6 already worked on the car. After a recorded Quick look session, Read codes and Freeze frame are
@@ -88,11 +97,11 @@ Add one entry to `DEFS` in `js/pids.js`:
 `bytes` must match what the ECU returns, because multi-PID responses are split using it. `kind` picks the imperial conversion
 (`temp`, `speed`, `pressure`, `flow`, `distance`, `volume_rate`, `none`). The PID then shows up in the profile editor
 automatically. Add a mock value in `MockTransport.prototype._pidData` (and to `MockTransport.SUPPORTED`) to see it in Demo mode.
-Manufacturer mode 21/22 PIDs would need a new request path in `obd.js`. That isn't in v1.
+Manufacturer mode 21/22 PIDs go in `ENHANCED` in `js/pids.js` (request, txHeader, rxFilter, decode). They are read-only.
 
 ## Tests
 ```
-node --test tests/core.test.js tests/ble.test.js   # parsing, PIDs, DTCs, queue, mock dongle, fake Android GATT stack (tests/fake-gatt.js)
+node --test tests/core.test.js tests/ble.test.js tests/v17.test.js   # parsing, PIDs, DTCs, queue, mock dongle, fake Android GATT stack (tests/fake-gatt.js)
 npm i --no-save puppeteer-core && node tests/e2e-mock.js [url]   # headless Chrome run in Demo mode
 ```
 
