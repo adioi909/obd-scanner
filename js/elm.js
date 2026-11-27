@@ -158,6 +158,100 @@
     return null;
   }
 
+
+  // ---------------- v1.7.0: adapter state tracking ----------------
+  /** Standard OBD broadcast header (CAN 11-bit functional address) and "no receive filter". */
+  var DEFAULT_HEADER = { tx: '7DF', rx: null };
+
+  /** Mutable record of what the app believes the adapter is configured as. */
+  function createAdapterState() {
+    return { dirty: false, dirtyCmds: [], header: { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }, headerKnown: true };
+  }
+  /** Back to the state right after a successful init (ATZ ... ATSPx leaves the default 7DF header, no CRA filter). */
+  function resetAdapterState(st) {
+    st.dirty = false; st.dirtyCmds = []; st.header = { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }; st.headerKnown = true;
+    return st;
+  }
+
+  function compactCmd(cmd) { return String(cmd || '').replace(/\s+/g, '').toUpperCase(); }
+
+  // AT commands that change how the adapter formats replies or which bus/module it talks to.
+  // ATDP / ATDPN (read protocol) and ATI / ATRV are read-only and deliberately NOT matched.
+  var AT_MUTATING = /^AT(Z|WS|D|D[01]|E[01]?|H[01]?|S[01]|SPA?[0-9A-C]?|TP[0-9A-C]?|SH[0-9A-F]*|CAF[01]?|CRA[0-9A-FX]*)$/;
+
+  // First byte of an OBD / UDS request that can write, reset or unlock something.
+  var WRITE_SERVICES = {
+    '04': 'Mode 04: clear DTCs, freeze frame and readiness monitors',
+    '10': 'UDS 0x10 DiagnosticSessionControl (switches the module into another session)',
+    '11': 'UDS 0x11 ECUReset (reboots the module)',
+    '27': 'UDS 0x27 SecurityAccess (unlocks protected functions)',
+    '2E': 'UDS 0x2E WriteDataByIdentifier (writes coding / configuration)',
+    '2F': 'UDS 0x2F InputOutputControlByIdentifier (drives actuators)',
+    '31': 'UDS 0x31 RoutineControl (runs module routines)',
+    '34': 'UDS 0x34 RequestDownload (starts reprogramming)',
+    '36': 'UDS 0x36 TransferData (reprogramming data)',
+    '37': 'UDS 0x37 RequestTransferExit (ends reprogramming)'
+  };
+
+  /**
+   * Classify a command typed in the Console.
+   * Returns { cmd, isAt, atMutating, write, service, reason }.
+   */
+  function classifyCommand(cmd) {
+    var c = compactCmd(cmd);
+    var out = { cmd: c, isAt: c.indexOf('AT') === 0, atMutating: false, write: false, service: null, reason: null };
+    if (out.isAt) { out.atMutating = AT_MUTATING.test(c); return out; }
+    if (/^[0-9A-F]{2}/.test(c)) {
+      var sv = c.slice(0, 2);
+      if (WRITE_SERVICES[sv]) { out.write = true; out.service = sv; out.reason = WRITE_SERVICES[sv]; }
+    }
+    return out;
+  }
+
+  /** Mark the adapter as possibly out of sync with what the parser expects (after a manual AT command). */
+  function markDirty(st, cmd) {
+    var c = compactCmd(cmd);
+    st.dirty = true;
+    if (st.dirtyCmds.indexOf(c) < 0) st.dirtyCmds.push(c);
+    if (/^AT(Z|D|D[01]|WS|SH|CRA|SP|TP)/.test(c)) st.headerKnown = false; // header / filter no longer known
+    return st;
+  }
+
+  function sameHeader(a, b) { return !!a && !!b && a.tx === b.tx && (a.rx || null) === (b.rx || null); }
+
+  /**
+   * Commands needed to move from the current header state to target {tx, rx}. rx null = clear filter (bare ATCRA).
+   * Only sends what changed; if the current state is unknown, sends both.
+   */
+  function headerSwitchCommands(st, target) {
+    var cmds = [];
+    var cur = st.headerKnown ? st.header : null;
+    if (!cur || cur.tx !== target.tx) cmds.push('ATSH' + target.tx);
+    if (!cur || (cur.rx || null) !== (target.rx || null)) cmds.push(target.rx ? 'ATCRA' + target.rx : 'ATCRA');
+    return cmds;
+  }
+  function headerKey(h) { return (h && h.tx ? h.tx : DEFAULT_HEADER.tx) + '/' + (h && h.rx ? h.rx : '-'); }
+
+  /** Find a mode-21/22 positive reply (0x61 / 0x62 + echoed id) in raw text and return the data bytes after the echo. */
+  function parseEnhancedResponse(raw, request) {
+    var req = compactCmd(request);
+    var mode = parseInt(req.slice(0, 2), 16);
+    var idBytes = hexToBytes(req.slice(2));
+    var msgs = parseResponse(raw, req);
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i];
+      var idx = m.indexOf(mode + 0x40);
+      if (idx < 0) continue;
+      var ok = true;
+      for (var k = 0; k < idBytes.length; k++) if (m[idx + 1 + k] !== idBytes[k]) { ok = false; break; }
+      if (ok) return m.slice(idx + 1 + idBytes.length);
+    }
+    return null;
+  }
+
+  /** Space-separated hex for logging. */
+  function bytesHex(bytes) { return (bytes || []).map(function (b) { return toHex(b); }).join(' '); }
+
   function toHex(n, width) {
     var s = n.toString(16).toUpperCase();
     while (s.length < (width || 2)) s = '0' + s;
@@ -172,7 +266,18 @@
     parsePidResponse: parsePidResponse,
     decodeSupported: decodeSupported,
     parseVin: parseVin,
-    toHex: toHex
+    toHex: toHex,
+    DEFAULT_HEADER: DEFAULT_HEADER,
+    WRITE_SERVICES: WRITE_SERVICES,
+    createAdapterState: createAdapterState,
+    resetAdapterState: resetAdapterState,
+    classifyCommand: classifyCommand,
+    markDirty: markDirty,
+    sameHeader: sameHeader,
+    headerSwitchCommands: headerSwitchCommands,
+    headerKey: headerKey,
+    parseEnhancedResponse: parseEnhancedResponse,
+    bytesHex: bytesHex
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.ELM = api;
 })(this);

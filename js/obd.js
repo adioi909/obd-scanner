@@ -19,6 +19,12 @@
     this.multiPid = this.opts.multiPid !== false; // try multi-PID requests on CAN
     this.fastResponse = this.opts.fastResponse !== false; // append response-count digit
     this.isCan = false;
+    this.adapter = ELM.createAdapterState(); // v1.7.0: header / dirty tracking
+    this.enhancedNS = {};      // enhanced PID -> true once it is given up on (shown as N/S)
+    this.enhancedFails = {};   // header|request -> consecutive failures
+    this.enhancedMaxFails = this.opts.enhancedMaxFails || 3;
+    this.enhancedEveryMs = this.opts.enhancedEveryMs != null ? this.opts.enhancedEveryMs : 2000; // temps change slowly
+    this._enhancedLast = 0;
   }
 
   Obd.prototype.cmd = function (c, t) { return this.s.send(c, t); };
@@ -100,8 +106,76 @@
     this.isCan = /^[6-9AB]$/.test(info.protocolNum);
     var rv = await at('ATRV', T.at);
     info.voltage = (ELM.cleanLines(rv, 'ATRV')[0] || '').trim();
+    ELM.resetAdapterState(this.adapter);
+    this.enhancedNS = {}; this.enhancedFails = {}; this._enhancedLast = 0;
+    this.protocol = protocol || '0';
     this.info = info;
     return info;
+  };
+
+  /**
+   * v1.7.0: re-sync the parser-critical adapter settings after a manual AT command from the Console
+   * (echo/spaces/headers off, long messages, CAN auto-format, default 7DF header, no receive filter).
+   * If the protocol may have changed (ATZ / ATD / ATSP / ATWS) the protocol is set again too.
+   */
+  Obd.prototype.resync = async function () {
+    var st = this.adapter, self = this;
+    var full = st.dirtyCmds.some(function (c) { return /^AT(Z|WS|D$|D[01]$|SP|TP)/.test(c); });
+    var cmds = ['ATE0', 'ATL0', 'ATS0', 'ATH0', 'ATAL', 'ATCAF1'];
+    if (full) cmds.push('ATAT1', 'ATSP' + (this.protocol || '0'));
+    cmds.push('ATSH' + ELM.DEFAULT_HEADER.tx, 'ATCRA');
+    this.log('warn', 'Adapter state was changed from the Console (' + st.dirtyCmds.join(', ') + '); re-syncing ' + cmds.join(' ') + ' before polling');
+    var ok = true;
+    for (var i = 0; i < cmds.length; i++) {
+      try {
+        var r = await this.cmd(cmds[i], 3000);
+        if (ELM.detectError(r, cmds[i]) === '?') self.log('warn', 'Re-sync: adapter rejected ' + cmds[i]);
+      } catch (e) {
+        if (e.message === 'CANCELLED' || e.fatal) throw e;
+        ok = false; self.log('warn', 'Re-sync: ' + cmds[i] + ' failed: ' + e.message);
+      }
+    }
+    if (ok) ELM.resetAdapterState(st);
+    else { st.headerKnown = false; }
+    return ok;
+  };
+
+  /** Switch the tx header / rx filter only if it differs from what the adapter is known to use. Returns false if the adapter rejected ATSH. */
+  Obd.prototype.setHeader = async function (target) {
+    var st = this.adapter;
+    var cmds = ELM.headerSwitchCommands(st, target);
+    var ok = true;
+    for (var i = 0; i < cmds.length; i++) {
+      var c = cmds[i], r = '';
+      try { r = await this.cmd(c, 2000); }
+      catch (e) {
+        if (e.message === 'CANCELLED' || e.fatal) throw e;
+        st.headerKnown = false;
+        this.log('warn', 'Header switch ' + c + ' failed: ' + e.message);
+        return false;
+      }
+      var err = ELM.detectError(r, c);
+      if (err === '?') {
+        if (/^ATSH/.test(c)) { st.headerKnown = false; this.log('warn', 'Adapter rejected ' + c); return false; }
+        this.log('warn', 'Adapter rejected ' + c + ' (continuing without a receive filter)');
+        ok = true; // CRA unsupported on some clones: physical addressing still works with headers off
+      }
+    }
+    st.header = { tx: target.tx, rx: target.rx || null };
+    st.headerKnown = true;
+    return ok;
+  };
+
+  /** Make sure the standard broadcast header (ATSH 7DF, no ATCRA filter) is active. */
+  Obd.prototype.restoreDefaultHeader = async function () {
+    if (this.adapter.headerKnown && ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER)) return true;
+    var ok = await this.setHeader(ELM.DEFAULT_HEADER);
+    if (!ok) {
+      // One more try: a stale prompt or a busy bus can eat the first command.
+      ok = await this.setHeader(ELM.DEFAULT_HEADER);
+    }
+    if (ok) this.log('info', 'Header restored to ' + ELM.DEFAULT_HEADER.tx + ' (receive filter cleared)');
+    return ok;
   };
 
   /** Query supported PIDs 0100/0120/0140/... -> array of PID hex strings. */
@@ -198,7 +272,99 @@
     return null;
   };
 
-  Obd.prototype.queryPids = async function (pids) {
+  /**
+   * v1.7.0: poll a mixed list. Standard mode-01 PIDs go out on the default 7DF header; enhanced PIDs are grouped
+   * by target header so ATSH / ATCRA is only sent when switching modules, and identical requests are sent once.
+   * The default header is ALWAYS restored before returning, on success, NO DATA, timeout or error.
+   */
+  Obd.prototype.queryPids = async function (pids, opts) {
+    var std = [], enh = [];
+    (pids || []).forEach(function (p) { (PIDS.isEnhanced(p) ? enh : std).push(p); });
+    var out = {};
+    if (std.length) {
+      if (!this.adapter.headerKnown || !ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER)) await this.restoreDefaultHeader();
+      out = await this._queryStandard(std);
+    }
+    var self = this;
+    enh = enh.filter(function (p) { return !self.enhancedNS[p]; });
+    var force = opts && opts.forceEnhanced;
+    if (enh.length && (force || Date.now() - this._enhancedLast >= this.enhancedEveryMs)) {
+      this._enhancedLast = Date.now();
+      try {
+        var ev = await this._queryEnhanced(enh);
+        Object.keys(ev).forEach(function (k) { out[k] = ev[k]; });
+      } finally {
+        await this.restoreDefaultHeader();
+      }
+    }
+    return out;
+  };
+
+  /** Group enhanced PIDs by header, then by request. */
+  Obd.prototype._queryEnhanced = async function (pids) {
+    var out = {}, groups = {}, order = [], self = this;
+    pids.forEach(function (p) {
+      var d = PIDS.get(p), hk = ELM.headerKey({ tx: d.txHeader, rx: d.rxFilter });
+      if (!groups[hk]) { groups[hk] = { header: { tx: d.txHeader, rx: d.rxFilter || null }, reqs: {}, reqOrder: [] }; order.push(hk); }
+      var g = groups[hk];
+      if (!g.reqs[d.request]) { g.reqs[d.request] = []; g.reqOrder.push(d.request); }
+      g.reqs[d.request].push(p);
+    });
+    for (var gi = 0; gi < order.length; gi++) {
+      var g = groups[order[gi]];
+      var switched = await this.setHeader(g.header);
+      if (!switched) {
+        g.reqOrder.forEach(function (rq) { self._enhancedFailed(g.header, rq, g.reqs[rq], 'header switch rejected'); });
+        continue;
+      }
+      for (var ri = 0; ri < g.reqOrder.length; ri++) {
+        var rq = g.reqOrder[ri], members = g.reqs[rq];
+        var r = '', errName = null;
+        try { r = await this.cmd(rq, Math.max(this._pidTimeout(), 1500)); }
+        catch (e) {
+          if (e.message === 'CANCELLED' || e.fatal) throw e;
+          errName = e.message; r = e.partial || '';
+        }
+        var tag = g.header.tx + (g.header.rx ? '/' + g.header.rx : '') + ' ' + rq;
+        var err = errName || ELM.detectError(r, rq);
+        var data = ELM.parseEnhancedResponse(r, rq);
+        if (!data) {
+          this.log('info', 'EXP ' + tag + ' -> ' + (err || 'no positive reply') + (r ? ' raw=' + livePreview(r) : ''));
+          this._enhancedFailed(g.header, rq, members, err || 'no positive reply');
+          continue;
+        }
+        this.enhancedFails[ELM.headerKey(g.header) + '|' + rq] = 0;
+        var parts = [];
+        members.forEach(function (p) {
+          var d = PIDS.get(p);
+          var v = PIDS.decodeEnhanced(p, data);
+          if (v != null) out[p] = v;
+          parts.push(d.short + '=' + (v == null ? 'n/a' : v));
+        });
+        var anyDef = PIDS.get(members[0]);
+        var bi = anyDef.byteIndex;
+        var byteNote = bi != null && data.length > bi ? (' | data[' + bi + '] (Torque ' + torqueLetter(bi) + ') = 0x' + ELM.toHex(data[bi]) + ' = ' + data[bi]) : (bi != null ? ' | reply too short for data[' + bi + ']' : '');
+        // Raw bytes always logged for experimental PIDs so the formula can be checked against a cold-start reading.
+        this.log('info', 'EXP ' + tag + ' raw (' + data.length + ' data bytes): ' + ELM.bytesHex(data) + byteNote + ' -> ' + parts.join(', '));
+      }
+    }
+    return out;
+  };
+
+  Obd.prototype._enhancedFailed = function (header, rq, members, why) {
+    var key = ELM.headerKey(header) + '|' + rq;
+    var n = (this.enhancedFails[key] || 0) + 1;
+    this.enhancedFails[key] = n;
+    if (n >= this.enhancedMaxFails) {
+      var self = this;
+      members.forEach(function (p) { self.enhancedNS[p] = true; });
+      this.log('warn', 'Enhanced request ' + header.tx + ' ' + rq + ' failed ' + n + ' times in a row (' + why + '); marking ' + members.join(', ') + ' as N/S and skipping it. Re-run init to retry.');
+    }
+  };
+
+  function torqueLetter(i) { var L = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'; return i < 26 ? L[i] : 'A' + L[i - 26]; }
+
+  Obd.prototype._queryStandard = async function (pids) {
     var out = {};
     if (!pids.length) return out;
     var timeout = this._pidTimeout();
