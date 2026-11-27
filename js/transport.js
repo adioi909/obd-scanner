@@ -155,17 +155,26 @@
   var CHAR_PROP_KEYS = ['broadcast', 'read', 'writeWithoutResponse', 'write', 'notify', 'indicate', 'authenticatedSignedWrites', 'reliableWrite', 'writableAuxiliaries'];
 
   /**
-   * Connect plan for attempt n (0 = first try, 1.. = reconnects). Rotates which notify characteristic is tried first,
-   * lengthens the startNotifications timeout (CCCD write may trigger bonding), and finally tries "write-first".
-   * Once a subscription has worked, reconnects keep that characteristic first.
+   * Connect plan for attempt n (0 = first try, 1.. = reconnects).
+   * This dongle (FFF0 / FFF1+FFEA notify, FFF2 write) hangs startNotifications on fff1 when it is tried first,
+   * but works when ffea is subscribed first and fff1 is subscribed second; replies then arrive on fff1.
+   * Default plan therefore subscribes BOTH, ffea then fff1. Rotation and write-first stay as fallbacks.
+   * Do not reorder to put the RX characteristic (fff1) first on reconnect — that is what hung.
    */
   BleTransport.prototype._planFor = function (n) {
     var T = this._opt('notifyTimeout', 5000);
-    if (this._goodNotifyUuid) return { n: n, rotate: 0, timeout: T * 2, writeFirst: false, pairing: false, name: 'known-good characteristic first' };
-    if (n === 0) return { n: 0, rotate: 0, timeout: T, writeFirst: false, pairing: false, name: 'default order (fff1 first)' };
-    if (n === 1) return { n: 1, rotate: 1, timeout: T * 2, writeFirst: false, pairing: true, name: 'rotated: ffea first, longer timeout' };
-    if (n === 2) return { n: 2, rotate: 0, timeout: T * 3, writeFirst: false, pairing: true, name: 'fff1 first again, longest timeout' };
-    return { n: n, rotate: 0, timeout: T * 2, writeFirst: true, pairing: true, name: 'write-first (ATZ is written before notifications are enabled)' };
+    if (n > 0 && this._partialHang && this._partialHang.worked && this._partialHang.worked.length) {
+      var worked = this._partialHang.worked.slice();
+      this._partialHang = null;
+      return { n: n, onlyUuids: worked, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: true, name: 'retry only ' + worked.map(shortUuid).join('+') + ' (subscribed before the hang)' };
+    }
+    if (this._goodSubscribeOrder && this._goodSubscribeOrder.length) {
+      return { n: n, rotate: 0, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: false, name: 'known-good order (both subscribed)' };
+    }
+    if (n === 0) return { n: 0, rotate: 1, subscribeAll: true, timeout: T, writeFirst: false, pairing: false, name: 'ffea then fff1 (both subscribed, RX expected on fff1)' };
+    if (n === 1) return { n: 1, rotate: 0, subscribeAll: true, timeout: T * 2, writeFirst: false, pairing: true, name: 'rotated: fff1 first, longer timeout' };
+    if (n === 2) return { n: 2, rotate: 1, subscribeAll: true, timeout: T * 3, writeFirst: false, pairing: true, name: 'ffea then fff1 again, longest timeout' };
+    return { n: n, rotate: 1, subscribeAll: true, timeout: T * 2, writeFirst: true, pairing: true, name: 'write-first (ATZ is written before notifications are enabled)' };
   };
 
   BleTransport.prototype.connect = function () {
@@ -219,6 +228,15 @@
     var self = this;
     plan = plan || this._planFor(0);
     this.subscribed = []; this.altNotify = []; this.notifyChars = []; this.writeChar = null;
+    // A previous page (pull-to-refresh) or a failed reconnect may have left the device "connected".
+    // startNotifications into a stale link hangs, so drop it and wait before a clean setup.
+    if (this.device && this.device.gatt && this.device.gatt.connected) {
+      this.log('info', 'GATT already connected; disconnecting and waiting before a clean setup');
+      this._expectDisc = true;
+      try { this.device.gatt.disconnect(); } catch (e) { /* ignore */ }
+      await sleep(this._opt('reconnectWait', 1000));
+      this._expectDisc = false;
+    }
     this.server = await this._runOp('gatt.connect', function () { return self.device.gatt.connect(); }, { timeout: this._opt('gattTimeout', 15000) });
     var d1 = this._opt('postConnectDelay', 400);
     if (d1) { this.log('info', 'Waiting ' + d1 + 'ms after connect before first GATT operation'); await sleep(d1); }
@@ -228,7 +246,6 @@
     if (!found) { var ne = new Error('No notify+write characteristic pair found. Check Console for the service list.'); ne.noRecover = true; throw ne; }
     this.writeChar = found.write; this.profileName = found.label;
     var list = found.notifyList.slice();
-    if (plan.rotate && list.length > 1) { var r = plan.rotate % list.length; list = list.slice(r).concat(list.slice(0, r)); }
     var want = String(this._opt('notifyChar', 'auto')).toLowerCase();
     this.notifyLocked = false;
     if (want !== 'auto') {
@@ -236,10 +253,23 @@
       if (m) { list = [m]; this.notifyLocked = true; this.log('info', 'Notify characteristic locked to ' + want + ' (Settings)'); }
       else this.log('warn', 'Settings asked for notify ' + want + ' but it is not in this service; using auto');
     }
-    var first = this.activeNotifyUuid || this._goodNotifyUuid;
-    if (first) {
-      var act = list.filter(function (c) { return c.uuid === first; })[0];
-      if (act) list = [act].concat(list.filter(function (c) { return c !== act; }));
+    if (!this.notifyLocked) {
+      // Prefer a previously successful full subscribe order (ffea then fff1). Never promote the
+      // RX characteristic (fff1) to first — that hung startNotifications on this dongle.
+      if (this._goodSubscribeOrder && this._goodSubscribeOrder.length) {
+        var byU = {};
+        list.forEach(function (c) { byU[c.uuid] = c; });
+        var ordered = [];
+        this._goodSubscribeOrder.forEach(function (u) { if (byU[u]) { ordered.push(byU[u]); delete byU[u]; } });
+        list.forEach(function (c) { if (byU[c.uuid]) ordered.push(c); });
+        list = ordered;
+      } else if (plan.onlyUuids && plan.onlyUuids.length) {
+        var wantU = plan.onlyUuids;
+        list = wantU.map(function (u) { return list.filter(function (c) { return c.uuid === u; })[0]; }).filter(Boolean);
+      } else if (plan.rotate && list.length > 1) {
+        var r = plan.rotate % list.length;
+        list = list.slice(r).concat(list.slice(0, r));
+      }
     }
     this.notifyChars = list;
     var wp = this.writeChar.properties;
@@ -267,15 +297,33 @@
     this.log('info', 'BLE link ready for ELM commands');
   };
 
-  /** Subscribe SEQUENTIALLY. Primary first (retry once on a plain failure); alternates only if the primary cannot be enabled. */
+  /** Subscribe SEQUENTIALLY. Default plan subscribes every notify characteristic (ffea, then fff1).
+   *  A hang after a successful subscribe is remembered so the next reconnect retries only the ones that worked. */
   BleTransport.prototype._subscribeSequence = async function (list, plan) {
-    var ok = await this._trySubscribe(list[0], true, plan);
-    var i = 1;
-    while (!ok && i < list.length) { ok = await this._trySubscribe(list[i], false, plan); i++; }
-    if (!ok) throw new Error('Could not enable notifications on any characteristic');
+    var subscribeAll = !plan || plan.subscribeAll !== false;
+    for (var i = 0; i < list.length; i++) {
+      if (!subscribeAll && this.subscribed.length) break;
+      try {
+        await this._trySubscribe(list[i], true, plan);
+      } catch (e) {
+        if ((e.timeout || e.busy) && this.subscribed.length) {
+          this._partialHang = { worked: this.subscribed.map(function (c) { return c.uuid; }), hung: list[i].uuid };
+          this.log('warn', 'startNotifications ' + shortUuid(list[i].uuid) + ' hung after ' +
+            this.subscribed.map(function (c) { return shortUuid(c.uuid); }).join('+') +
+            ' had already subscribed; will reconnect and retry the working one(s)');
+        }
+        throw e;
+      }
+    }
+    if (!this.subscribed.length) throw new Error('Could not enable notifications on any characteristic');
+    if (this.subscribed.length > 1)
+      this.log('info', 'Subscribed ' + this.subscribed.map(function (c) { return shortUuid(c.uuid); }).join(' then ') +
+        ' (listening on all; RX is expected on fff1 for this dongle)');
     this.altNotify = list.filter(function (c) { return this.subscribed.indexOf(c) < 0; }, this);
     if (this.altNotify.length && !this.notifyLocked)
       this.log('info', 'Alternate notify characteristic(s) held in reserve (used only if no RX arrives): ' + this.altNotify.map(function (c) { return shortUuid(c.uuid); }).join(', '));
+    if (this.subscribed.length === list.length && list.length > 1)
+      this._goodSubscribeOrder = this.subscribed.map(function (c) { return c.uuid; });
   };
 
   BleTransport.prototype._attachListener = function (char) {
@@ -491,21 +539,36 @@
     this.kind = 'mock'; this.name = 'Mock OBDII (simulated)';
     this.echo = true; this.spaces = true; this.headers = false; this.linefeed = true;
     this.t0 = Date.now();
-    this.dtcs = { '03': ['0133', '0442'], '07': ['0171'], '0A': ['0133'] };
+    this.car = this.opts.car || null;
+    this.dtcs = this.opts.dtcs || (this.car === 'mitsubishi2013'
+      ? { '03': [], '07': ['0420'], '0A': [] }
+      : { '03': ['0133', '0442'], '07': ['0171'], '0A': ['0133'] });
     this.latency = this.opts.latency != null ? this.opts.latency : 25;
+    this.splitPrompt = !!this.opts.splitPrompt;
+    if (this.car === 'mitsubishi2013' && this.opts.vin == null) this.opts.vin = 'JA32U2FU9DU010476';
   }
   MockTransport.prototype.connect = async function () { this.connected = true; return true; };
   MockTransport.prototype.disconnect = async function () { this.connected = false; this.onDisconnect(); };
   MockTransport.prototype.write = async function (str) {
     var self = this;
     var cmd = str.replace(/[\r\n]/g, '').trim().toUpperCase();
-    var reply = this._respond(cmd.replace(/\s+/g, ''));
-    var out = (this.echo ? cmd + '\r' : '') + reply + '\r\r>';
-    // Deliver in 20-byte BLE-like chunks
-    var chunks = [];
-    for (var i = 0; i < out.length; i += 20) chunks.push(out.slice(i, i + 20));
+    var compact = cmd.replace(/\s+/g, '');
+    var reply = this._respond(compact);
+    if (reply == null) return; // hang: no prompt, like a clone that never finishes a multi-PID request
+    var body = (this.echo ? cmd + '\r' : '') + reply;
     var delay = this.latency;
-    chunks.forEach(function (c, idx) { setTimeout(function () { self.onData(c); }, delay + idx * 2); });
+    function emit(text, extra) {
+      var chunks = [];
+      for (var i = 0; i < text.length; i += 20) chunks.push(text.slice(i, i + 20));
+      chunks.forEach(function (c, idx) { setTimeout(function () { self.onData(c); }, delay + (extra || 0) + idx * 2); });
+    }
+    // Hardware often delivers the payload and the prompt in two notifications: "...\r" then "\r>".
+    if (this.splitPrompt) {
+      emit(body + '\r', 0);
+      emit('\r>', 8);
+    } else {
+      emit(body + '\r\r>', 0);
+    }
   };
 
   MockTransport.prototype._sim = function () {
@@ -595,10 +658,10 @@
       if (a === 'S1') { this.spaces = true; return 'OK'; }
       if (a === 'H0') { this.headers = false; return 'OK'; }
       if (a === 'H1') { this.headers = true; return 'OK'; }
-      if (a === 'RV') return '12.6V';
+      if (a === 'RV') return this.car === 'mitsubishi2013' ? '14.6V' : '12.6V';
       if (a === 'DPN') return 'A6';
       if (a === 'DP') return 'AUTO, ISO 15765-4 (CAN 11/500)';
-      if (/^(L[01]|SP[0-9A-C]|AT[0-2]|ST[0-9A-F]{2}|D|WS|CAF[01]|M[01])$/.test(a)) return 'OK';
+      if (/^(L[01]|SP[0-9A-C]|AT[0-2]|ST[0-9A-F]{2}|AL|D|WS|CAF[01]|M[01])$/.test(a)) return 'OK';
       return '?';
     }
     if (!/^[0-9A-F]+$/.test(c) || c.length % 2 === 1 && c.length > 2) {
@@ -619,20 +682,27 @@
       var bytes = '490201' + vin.split('').map(function (ch) { return hx(ch.charCodeAt(0)); }).join('');
       // ISO-TP style multi-frame: 014 + 0:6 bytes, 1..:7 bytes
       var b = bytes.match(/../g), lines = ['014'], i = 0, seq = 0;
-      lines.push('0:' + self._fmt(b.slice(0, 6).join(''))); i = 6;
-      while (i < b.length) { seq++; var chunk = b.slice(i, i + 7); while (chunk.length < 7) chunk.push('00'); lines.push(seq.toString(16).toUpperCase() + ':' + self._fmt(chunk.join(''))); i += 7; }
+      lines.push('0: ' + self._fmt(b.slice(0, 6).join(''))); i = 6;
+      while (i < b.length) { seq++; var chunk = b.slice(i, i + 7); while (chunk.length < 7) chunk.push('00'); lines.push(seq.toString(16).toUpperCase() + ': ' + self._fmt(chunk.join(''))); i += 7; }
       return lines.join('\r');
     }
     if (mode === '01' || mode === '02') {
       var pids = [];
       if (mode === '01') { for (var k = 0; k < rest.length; k += 2) pids.push(rest.substr(k, 2)); }
       else pids.push(rest.substr(0, 2));
+      if (mode === '01' && pids.length > 1 && this.opts.multiPidHang) return null;
+      if (mode === '01' && pids.length > 1 && this.opts.multiPidNoData) return 'NO DATA';
       if (mode === '02' && !this.dtcs['03'].length) return 'NO DATA';
       var out = hx(parseInt(mode, 16) + 0x40);
       var any = false;
       pids.forEach(function (p) {
         var data;
-        if (['00', '20', '40', '60'].indexOf(p) >= 0) data = (p === '60') ? null : self._bitmask(parseInt(p, 16));
+        if (['00', '20', '40', '60'].indexOf(p) >= 0) {
+          if (self.car === 'mitsubishi2013' && p === '00') data = 'BE3FA813';
+          else if (self.car === 'mitsubishi2013' && p === '20') data = '9017E001';
+          else if (self.car === 'mitsubishi2013' && p === '40') data = 'FED00040';
+          else data = (p === '60') ? null : self._bitmask(parseInt(p, 16));
+        } else if (mode === '01' && p === '01' && self.car === 'mitsubishi2013') data = '0007E500';
         else if (mode === '02' && p === '02') data = '0133';
         else data = self._pidData(p);
         if (data != null) { out += p + (mode === '02' ? '00' : '') + data; any = true; }
@@ -640,8 +710,8 @@
       if (!any) return 'NO DATA';
       if (out.length / 2 > 7) {
         var bb = out.match(/../g), ls = [hx2(bb.length).slice(1)], j = 6, sq = 0;
-        ls.push('0:' + self._fmt(bb.slice(0, 6).join('')));
-        while (j < bb.length) { sq++; var ch = bb.slice(j, j + 7); while (ch.length < 7) ch.push('00'); ls.push(sq.toString(16).toUpperCase() + ':' + self._fmt(ch.join(''))); j += 7; }
+        ls.push('0: ' + self._fmt(bb.slice(0, 6).join('')));
+        while (j < bb.length) { sq++; var ch = bb.slice(j, j + 7); while (ch.length < 7) ch.push('00'); ls.push(sq.toString(16).toUpperCase() + ': ' + self._fmt(ch.join(''))); j += 7; }
         return ls.join('\r');
       }
       return this._fmt(out);

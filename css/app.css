@@ -1,6 +1,6 @@
 :root { --bg:#0d1117; --card:#161b22; --line:#2a3340; --text:#e6edf3; --dim:#8a97a8; --acc:#ffb020; --ok:#3fb950; --bad:#f85149; --blue:#58a6ff; }
 * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-html,body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui,-apple-system,Roboto,sans-serif; }
+html,body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui,-apple-system,Roboto,sans-serif; overscroll-behavior:none; overscroll-behavior-y:none; }
 body { padding-bottom:calc(76px + env(safe-area-inset-bottom)); }
 .hidden { display:none !important; }
 .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }

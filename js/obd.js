@@ -47,10 +47,15 @@
     }
     var T = Object.assign({ wake: 2000, atz: 10000, atws: 8000, ati: 4000, at: 3000, pid: 12000 }, this.opts.initTimeouts || {});
 
-    self.log('info', 'Init: bare CR to wake the adapter');
-    await at('', T.wake);
-    self.log('info', 'Init: ATZ (up to ' + T.atz + 'ms; clones can be slow or silent)');
-    var z = await at('ATZ', T.atz);
+    // If a reserve notify characteristic is still unsubscribed, do not burn 2s+10s on the wrong channel.
+    var tr0 = self.s.t;
+    var probing = !!(tr0 && tr0.altNotify && tr0.altNotify.length);
+    var wakeMs = probing ? Math.min(T.wake, 800) : T.wake;
+    var atzMs = probing ? Math.min(T.atz, 1500) : T.atz;
+    self.log('info', 'Init: bare CR to wake the adapter' + (probing ? ' (short ' + wakeMs + 'ms probe; reserve notify not yet subscribed)' : ''));
+    await at('', wakeMs);
+    self.log('info', 'Init: ATZ (up to ' + atzMs + 'ms; clones can be slow or silent)');
+    var z = await at('ATZ', atzMs);
     info.elm = identFrom(z, 'ATZ');
 
     // Adapter silent: one deliberate change per step (reserve notify characteristic, then write mode), never per command.
@@ -76,7 +81,9 @@
     }
     self.log('info', 'Init: adapter id = ' + (info.elm || '(unknown)'));
 
-    await at('ATE0', T.at); await at('ATL0', T.at); await at('ATS0', T.at); await at('ATH0', T.at); await at('ATAT1', T.at);
+    await at('ATE0', T.at); await at('ATL0', T.at); await at('ATS0', T.at); await at('ATH0', T.at);
+    await at('ATAL', T.at); // allow long ISO-TP / multi-PID replies (default ELM limit is 8 bytes)
+    await at('ATAT1', T.at);
     await at('ATSP' + (protocol || '0'), T.at);
     var r = '';
     try { r = await this.cmd('0100', T.pid); } catch (e) { if (e.fatal || self.s.dead) throw e; r = e.partial || ''; }
@@ -151,34 +158,98 @@
    * Query a list of PIDs once. Uses multi-PID requests (up to 6 per request) on CAN when enabled,
    * falling back automatically to single requests. Returns {pid: metricValue}.
    */
+  function livePreview(raw) {
+    return String(raw || '').replace(/\r/g, '\\r').replace(/\n/g, '\\n').slice(0, 180);
+  }
+
+  Obd.prototype._pidTimeout = function () {
+    return this.opts.pidTimeout || (this.s && this.s.opts && this.s.opts.timeout) || 1500;
+  };
+
+  /** Ask for one PID. Retries without the fast-response "1" suffix if the adapter rejects it or nothing decodes. */
+  Obd.prototype._queryOne = async function (pid, timeout) {
+    var cmd = '01' + pid;
+    if (this.fastResponse && this.isCan) cmd += '1';
+    var r, errName = null;
+    try { r = await this.cmd(cmd, timeout); }
+    catch (e) {
+      if (e.message === 'CANCELLED') throw e;
+      r = e.partial || '';
+      errName = e.message;
+    }
+    var err = errName || ELM.detectError(r, cmd);
+    this.log('info', 'Live ' + cmd + ' -> ' + (errName ? errName + (r ? ' partial=' + livePreview(r) : ' (no RX)') : livePreview(r) || '(empty)'));
+    var parsed = ELM.parsePidResponse(r, 1, PIDS.length, cmd);
+    if (parsed[pid]) return PIDS.decode(pid, parsed[pid]);
+    if (cmd.length % 2 === 1 && (err === '?' || !parsed[pid])) {
+      this.fastResponse = false;
+      this.log('warn', 'Fast-response suffix failed for ' + cmd + (err ? ' (' + err + ')' : ' (no decode)') + '; retrying as 01' + pid);
+      try { r = await this.cmd('01' + pid, timeout); }
+      catch (e) {
+        if (e.message === 'CANCELLED') throw e;
+        r = e.partial || '';
+        this.log('info', 'Live 01' + pid + ' -> ' + e.message + (r ? ' partial=' + livePreview(r) : ' (no RX)'));
+        return null;
+      }
+      this.log('info', 'Live 01' + pid + ' -> ' + livePreview(r));
+      parsed = ELM.parsePidResponse(r, 1, PIDS.length, '01' + pid);
+      if (parsed[pid]) return PIDS.decode(pid, parsed[pid]);
+    }
+    return null;
+  };
+
   Obd.prototype.queryPids = async function (pids) {
     var out = {};
     if (!pids.length) return out;
+    var timeout = this._pidTimeout();
+    var self = this;
     var groups = [];
     var per = (this.multiPid && this.isCan) ? 6 : 1;
     for (var i = 0; i < pids.length; i += per) groups.push(pids.slice(i, i + per));
     for (var g = 0; g < groups.length; g++) {
       var grp = groups[g];
+      if (grp.length === 1) {
+        var one = await this._queryOne(grp[0], timeout);
+        if (one != null) out[grp[0]] = one;
+        continue;
+      }
       var cmd = '01' + grp.join('');
-      if (grp.length === 1 && this.fastResponse && this.isCan) cmd += '1';
-      var r;
-      try { r = await this.cmd(cmd, this.opts.pidTimeout || 1500); } catch (e) { if (e.message === 'CANCELLED') throw e; continue; }
-      var err = ELM.detectError(r, cmd);
-      if (err === '?' && cmd.length % 2 === 1) { this.fastResponse = false; this.log('warn', 'Adapter rejected response-count suffix; disabled'); }
+      var r = '', timedOut = false, failReason = null;
+      try { r = await this.cmd(cmd, timeout); }
+      catch (e) {
+        if (e.message === 'CANCELLED') throw e;
+        timedOut = e.message === 'TIMEOUT';
+        r = e.partial || '';
+        failReason = e.message + (r ? ' partial=' + livePreview(r) : ' (no RX)');
+        this.log('info', 'Live ' + cmd + ' -> ' + failReason);
+      }
+      if (!failReason) this.log('info', 'Live ' + cmd + ' -> ' + (livePreview(r) || '(empty)'));
+      var err = failReason ? (timedOut ? 'TIMEOUT' : failReason) : ELM.detectError(r, cmd);
       var parsed = ELM.parsePidResponse(r, 1, PIDS.length, cmd);
       var got = 0;
-      grp.forEach(function (p) { if (parsed[p]) { out[p] = PIDS.decode(p, parsed[p]); got++; } });
-      if (grp.length > 1 && got < grp.length) {
-        if (got === 0) { this.multiPid = false; this.log('warn', 'Multi-PID request failed; falling back to single-PID requests'); }
-        // fetch the missing ones individually this round
+      grp.forEach(function (p) {
+        if (parsed[p]) {
+          var v = PIDS.decode(p, parsed[p]);
+          if (v != null) { out[p] = v; got++; }
+        }
+      });
+      if (got < grp.length) {
+        var why = err ? String(err) : (got ? ('decoded ' + got + '/' + grp.length + ' PIDs') : 'no PIDs decoded');
+        if (got === 0 || timedOut || err) {
+          this.multiPid = false;
+          this.log('warn', 'Multi-PID request ' + cmd + ' failed (' + why + '); falling back to single-PID requests');
+        } else {
+          this.log('info', 'Multi-PID request ' + cmd + ' incomplete (' + why + '); fetching the missing PIDs individually');
+        }
+        if (timedOut) {
+          // Nudge the adapter in case it is still waiting on the ECU, so the next command is not mixed with a late prompt.
+          try { await this.cmd('', Math.min(500, timeout)); } catch (e) { if (e.message === 'CANCELLED') throw e; }
+        }
         for (var k = 0; k < grp.length; k++) {
           var p = grp[k];
           if (out[p] != null) continue;
-          try {
-            var r1 = await this.cmd('01' + p, this.opts.pidTimeout || 1500);
-            var pr = ELM.parsePidResponse(r1, 1, PIDS.length, '01' + p);
-            if (pr[p]) out[p] = PIDS.decode(p, pr[p]);
-          } catch (e) { if (e.message === 'CANCELLED') throw e; }
+          var v1 = await this._queryOne(p, timeout);
+          if (v1 != null) out[p] = v1;
         }
       }
     }

@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.3';
+  var APP_VERSION = 'v1.4';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -73,6 +73,7 @@
       Store.saveSettings(settings);
       if (state.obd) { state.obd.multiPid = settings.multiPid; state.obd.fastResponse = settings.fastResponse; }
       if (state.session) state.session.opts.timeout = settings.timeout;
+      if (state.obd) state.obd.opts.pidTimeout = settings.timeout;
       renderTiles();
     };
     ['#s-units', '#s-proto', '#s-multi', '#s-fast', '#s-write', '#s-notify', '#s-timeout'].forEach(function (id) { $(id).addEventListener('change', save); });
@@ -83,6 +84,16 @@
 
   async function connect(kind, acceptAll) {
     if (state.connected) await disconnect();
+    else if (state.transport) {
+      // Link was lost or a previous attempt failed: drop leftover GATT/listeners before a new connect.
+      var prev = state.transport;
+      state.transport = null;
+      if (state.session) { try { state.session.clearQueue(); } catch (e) { /* ignore */ } state.session = null; }
+      prev.onDisconnect = function () {};
+      try { await prev.disconnect(); } catch (e) { /* ignore */ }
+      log('info', 'Cleaned up the previous GATT session; waiting 800ms before reconnecting');
+      await sleep(800);
+    }
     var t;
     try {
       if (kind === 'mock') t = new Transport.MockTransport({ log: log });
@@ -106,7 +117,7 @@
     state.transport = t;
     t.onDisconnect = function () { onLinkLost(); };
     state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout });
-    state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse });
+    state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse, pidTimeout: settings.timeout });
     state.connected = true;
     var bleLabel = t.kind === 'mock' ? 'Simulated' : (t.name + ' · ' + (t.profileName || '') + (t.subscribed && t.subscribed.length ? ' · ntf ' + t.subscribed.map(function (c) { return Transport.shortUuid(c.uuid); }).join('+') : ''));
     $('#i-ble').textContent = bleLabel;
@@ -156,8 +167,14 @@
     if (!state.connected) return;
     state.connected = false;
     stopLive();
+    if (state.session) { try { state.session.clearQueue(); } catch (e) { /* ignore */ } }
+    var t = state.transport;
+    if (t) {
+      t.onDisconnect = function () {};
+      try { t.disconnect(); } catch (e) { /* ignore */ }
+    }
     setStatus('err', 'Link lost');
-    toast('Bluetooth link lost', 3000);
+    toast('Bluetooth link lost. Wait a moment, then tap Connect.', 4000);
     $('#btn-disconnect').classList.add('hidden'); $('#btn-reinit').classList.add('hidden');
   }
 
@@ -316,6 +333,7 @@
     var pids = p.pids.filter(function (x) { return PIDS.get(x) && (!state.supported || state.supported.indexOf(x) >= 0); });
     if (!pids.length) { toast('This car supports none of the PIDs in this profile'); return; }
     state.live = true; $('#btn-live').textContent = 'Stop live'; keepAwake(true);
+    log('info', 'Live start: ' + pids.join(',') + ' (raw request/response lines are always logged)');
     var cycles = 0, t0 = Date.now(), recent = [];
     liveLoop = (async function () {
       while (state.live && state.connected) {
