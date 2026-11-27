@@ -9,7 +9,7 @@ function createFakeGattDongle(opts) {
   const stats = { concurrentRejections: 0, fakeBusy: 0, connects: 0, disconnects: 0, startNotif: [], writes: [] };
   const discListeners = [];
   const once = { hang: {}, fail: {} };
-  let busy = false, busyWrites = opts.busyOnWrites || 0, writtenSinceConnect = false;
+  let busy = false, busyWrites = opts.busyOnWrites || 0, writtenSinceConnect = false, notifsThisConnect = 0;
   const elm = new MockTransport(Object.assign({ latency: 0 }, opts.mock || {}));
   if (opts.silent) elm.write = async function () {};
   let writeBuf = [];
@@ -39,8 +39,11 @@ function createFakeGattDongle(opts) {
           if ((opts.hangStartNotificationsAlways || []).includes(uuid)) return { hang: true };
           if (opts.hangAllStartNotifications) return { hang: true };
           if (opts.notifyOnlyAfterWrite && !writtenSinceConnect) return { hang: true };
+          // Hang only when this characteristic is the first startNotifications of the current GATT connection
+          // (models the real OBDII clone: fff1 hangs if tried first, works after ffea is already subscribed).
+          if ((opts.hangStartNotificationsIfFirst || []).includes(uuid) && notifsThisConnect === 0) return { hang: true };
           if ((opts.failFirstStartNotifications || []).includes(uuid) && !once.fail[uuid]) { once.fail[uuid] = true; return { error: 'GATT operation failed for unknown reason.' }; }
-          c._notifying = true; return { value: c };
+          c._notifying = true; notifsThisConnect++; return { value: c };
         });
       },
       getDescriptors() { return op('getDescriptors', () => ({ value: [{ uuid: '00002902-0000-1000-8000-00805f9b34fb' }] })); },
@@ -87,10 +90,10 @@ function createFakeGattDongle(opts) {
     name: 'OBDII', id: 'fake',
     gatt: {
       connected: false,
-      connect() { stats.connects++; device.gatt.connected = true; writtenSinceConnect = false; return new Promise(r => setTimeout(() => r(server), delay)); },
+      connect() { stats.connects++; device.gatt.connected = true; writtenSinceConnect = false; notifsThisConnect = 0; return new Promise(r => setTimeout(() => r(server), delay)); },
       disconnect() {
         if (!device.gatt.connected) return;
-        device.gatt.connected = false; busy = false; writtenSinceConnect = false; stats.disconnects++;
+        device.gatt.connected = false; busy = false; writtenSinceConnect = false; notifsThisConnect = 0; stats.disconnects++;
         [ffea, fff1].forEach(c => { c._notifying = false; });
         setTimeout(() => discListeners.forEach(fn => fn()), 0);
       }

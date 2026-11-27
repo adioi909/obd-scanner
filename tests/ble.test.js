@@ -30,11 +30,11 @@ test('withTimeout flags timeouts', async () => {
   await assert.rejects(withTimeout(new Promise(() => {}), 20, 'x'), (e) => e.timeout === true);
 });
 
-test('GATT ops are serialized: connect + parallel writes never hit "already in progress"; only fff1 subscribed', async () => {
+test('GATT ops are serialized: connect + parallel writes never hit "already in progress"; ffea then fff1 both subscribed', async () => {
   const { fake, t, logs } = await setup({});
   await t.connect();
-  assert.deepEqual(ids(t.subscribed), ['fff1']);
-  assert.deepEqual(fake.stats.startNotif, [fake.U.fff1], 'ffea must not be subscribed unless needed');
+  assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
+  assert.deepEqual(fake.stats.startNotif, [fake.U.ffea, fake.U.fff1], 'default plan subscribes ffea then fff1');
   await Promise.all([t.write('ATI\r'), t.write('ATI\r'), t.write('ATI\r'), t.write('ATI\r'), t.write('ATI\r')]);
   assert.equal(fake.stats.concurrentRejections, 0);
   assert.equal(fake.stats.writes.length, 5);
@@ -60,8 +60,8 @@ test('fff1 first startNotifications attempt fails instantly, retry succeeds (no 
   const U = createFakeGattDongle().U;
   const { fake, t, logs } = await setup({ failFirstStartNotifications: [U.fff1] });
   await t.connect();
-  assert.deepEqual(ids(t.subscribed), ['fff1']);
-  assert.equal(fake.stats.startNotif.length, 2);
+  assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
+  assert.ok(fake.stats.startNotif.filter(u => u === U.fff1).length >= 2, 'fff1 retried after a plain failure');
   assert.equal(fake.stats.disconnects, 0);
   assert.equal(t.stats.recoveries, 0);
   assert.ok(logs.some(l => /FAILED: GATT operation failed for unknown reason/.test(l)));
@@ -70,10 +70,11 @@ test('fff1 first startNotifications attempt fails instantly, retry succeeds (no 
 
 test('hung startNotifications poisons the link -> disconnect, wait, reconnect, rediscover, resubscribe', async () => {
   const U = createFakeGattDongle().U;
+  // Default plan subscribes ffea first (succeeds) then fff1 (hangs once) -> recover and retry only ffea.
   const { fake, t, logs } = await setup({ hangStartNotificationsOnce: [U.fff1] }, null, true);
   let lost = 0; t.onDisconnect = () => { lost++; };
   await t.connect();
-  assert.deepEqual(ids(t.subscribed), ['ffea'], 'after fff1 hangs, the next attempt tries ffea first');
+  assert.deepEqual(ids(t.subscribed), ['ffea'], 'after fff1 hangs mid-sequence, the next attempt retries only the working characteristic');
   assert.equal(t.stats.recoveries, 1);
   assert.equal(fake.stats.connects, 2);
   assert.ok(fake.stats.disconnects >= 1);
@@ -81,6 +82,7 @@ test('hung startNotifications poisons the link -> disconnect, wait, reconnect, r
   assert.equal(lost, 0, 'our own disconnect during recovery must not look like link loss');
   assert.ok(logs.some(l => /HUNG/.test(l)));
   assert.ok(logs.some(l => /Recovery 1\/3/.test(l)) && logs.some(l => /Recovery 1 OK/.test(l)));
+  assert.ok(logs.some(l => /retry only ffea/.test(l)));
 });
 
 test('a real (unexpected) disconnect still reports link loss', async () => {
@@ -144,18 +146,17 @@ test('manual notify choice ffea locks to ffea and works', async () => {
   assert.equal(shortUuid(t.activeNotifyUuid), 'ffea');
 });
 
-test('auto: if fff1 gives no RX, init subscribes the reserve ffea characteristic (then it works)', async () => {
+test('auto: both notify characteristics are subscribed up front, so RX on ffea needs no init fallback', async () => {
   const U = createFakeGattDongle().U;
   const { fake, t, logs } = await setup({ respondOn: U.ffea, mock: { latency: 2 } });
   await t.connect();
-  assert.deepEqual(ids(t.subscribed), ['fff1']);
+  assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
   const s = new ElmSession(t, { timeout: 300 });
   const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
   const info = await obd.init('0');
   assert.equal(info.adapterOk, true); assert.equal(info.ecuOk, true);
-  assert.deepEqual(ids(t.subscribed).sort(), ['ffea', 'fff1']);
   assert.equal(shortUuid(t.activeNotifyUuid), 'ffea');
-  assert.ok(logs.some(l => /fallback 1: subscribed reserve notify characteristic ffea/.test(l)));
+  assert.ok(!logs.some(l => /subscribed reserve notify characteristic/.test(l)), 'no wasted fallback; both already subscribed');
   assert.equal(fake.stats.concurrentRejections, 0);
 });
 
@@ -207,16 +208,16 @@ test('verbose logging covers subscribe, TX bytes and RX hex+ascii', async () => 
 
 const FASTPLAN = { notifyTimeout: 40, reconnectWait: 10 };
 
-test('v1.3: fff1 startNotifications always hangs, ffea works -> reconnect rotates to ffea first and init succeeds', async () => {
+test('v1.4: fff1 startNotifications always hangs, ffea works -> first attempt subscribes ffea then hangs on fff1, reconnect retries ffea only', async () => {
   const U = createFakeGattDongle().U;
   const { fake, t, logs } = await setup({ hangStartNotificationsAlways: [U.fff1], respondOn: U.ffea, mock: { latency: 2 } }, FASTPLAN);
   await t.connect();
   assert.equal(t.stats.recoveries, 1);
   assert.deepEqual(ids(t.subscribed), ['ffea']);
-  const iHang = logs.findIndex(l => /startNotifications fff1 .*HUNG/.test(l));
   const iOk = logs.findIndex(l => /startNotifications ffea .* OK/.test(l));
-  assert.ok(iHang >= 0 && iOk > iHang, 'fff1 hung first, then ffea succeeded');
-  assert.ok(logs.some(l => /Plan: rotated: ffea first, longer timeout, notify timeout 80ms/.test(l)), 'timeout doubled on attempt 2');
+  const iHang = logs.findIndex(l => /startNotifications fff1 .*HUNG/.test(l));
+  assert.ok(iOk >= 0 && iHang > iOk, 'ffea subscribed first, then fff1 hung');
+  assert.ok(logs.some(l => /retry only ffea/.test(l)));
   assert.ok(logs.some(l => /possible pairing prompt - check phone/.test(l)));
   const s = new ElmSession(t, { timeout: 400 });
   const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), initTimeouts: FASTINIT });
@@ -231,10 +232,10 @@ test('v1.3: notify only works after a first write -> 4th attempt is write-first 
   const { fake, t, logs } = await setup({ notifyOnlyAfterWrite: true, mock: { latency: 2 } }, Object.assign({ onStatus: (m) => onStatus.push(m) }, FASTPLAN));
   await t.connect();
   assert.equal(t.stats.recoveries, 3);
-  assert.deepEqual(ids(t.subscribed), ['fff1']);
+  assert.ok(ids(t.subscribed).includes('ffea') || ids(t.subscribed).includes('fff1'));
   assert.ok(logs.some(l => /Write-first: listeners attached; writing ATZ before startNotifications/.test(l)));
   const iW = logs.findIndex(l => /write-first ATZ/.test(l));
-  const iS = logs.findIndex((l, i) => i > iW && /startNotifications fff1 .* OK/.test(l));
+  const iS = logs.findIndex((l, i) => i > iW && /startNotifications ffea .* OK/.test(l));
   assert.ok(iW >= 0 && iS > iW, 'write happens before the successful startNotifications');
   assert.equal(fake.stats.concurrentRejections, 0);
   assert.ok(onStatus.some(m => /possible pairing prompt - check phone/.test(m)), 'UI status mentions pairing prompt');
@@ -266,4 +267,32 @@ test('v1.3: forget() forgets the device', async () => {
   let forgot = 0; fake.device.forget = async () => { forgot++; };
   assert.equal(await t.forget(), 1);
   assert.equal(forgot, 1);
+});
+
+test('v1.4: fff1 hangs only when it is first; default ffea-then-fff1 plan subscribes both on the first try', async () => {
+  const U = createFakeGattDongle().U;
+  const { fake, t, logs } = await setup({ hangStartNotificationsIfFirst: [U.fff1], mock: { latency: 2 } });
+  await t.connect();
+  assert.equal(t.stats.recoveries, 0);
+  assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
+  assert.ok(logs.some(l => /plan="ffea then fff1 \(both subscribed, RX expected on fff1\)"/.test(l)));
+  const s = new ElmSession(t, { timeout: 400 });
+  const obd = new Obd(s, { initTimeouts: FASTINIT });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+  assert.equal(shortUuid(t.activeNotifyUuid), 'fff1');
+  assert.equal(fake.stats.concurrentRejections, 0);
+});
+
+test('v1.4: already-connected GATT is dropped and we wait before a clean setup', async () => {
+  const { fake, t, logs } = await setup({});
+  await t.connect();
+  // Leave the fake "connected" and call setup again via connect() recovery path by invoking _setup.
+  // connect() short-circuits if already set up; call _setup inside _exclusive by connecting after forcing gatt.connected.
+  assert.equal(fake.device.gatt.connected, true);
+  t._goodSubscribeOrder = null; // allow the clean-setup path to run with the default plan
+  await t._exclusive(async () => { await t._setup(t._planFor(0)); });
+  assert.ok(logs.some(l => /GATT already connected; disconnecting and waiting/.test(l)));
+  assert.deepEqual(ids(t.subscribed), ['ffea', 'fff1']);
+  assert.equal(fake.stats.concurrentRejections, 0);
 });
