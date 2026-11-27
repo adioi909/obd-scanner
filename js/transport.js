@@ -651,6 +651,10 @@
     this.latency = this.opts.latency != null ? this.opts.latency : 25;
     this.splitPrompt = !!this.opts.splitPrompt;
     if (this.car === 'mitsubishi2013' && this.opts.vin == null) this.opts.vin = 'JA32U2FU9DU010476';
+    // v1.7.0: simulated CVT TCM on 7E1/7E9 (mode 21). opts.tcm: true (default) | false (no TCM: NO DATA) | 'hang' (no prompt) | 'short'
+    this.tcm = this.opts.tcm != null ? this.opts.tcm : true;
+    this.txHeader = '7DF'; this.rxFilter = null;
+    this.headerLog = []; // every ATSH / ATCRA seen, for tests
   }
   MockTransport.prototype.connect = async function () { this.connected = true; return true; };
   MockTransport.prototype.disconnect = async function () { this.connected = false; this.onDisconnect(); };
@@ -754,7 +758,9 @@
     var self = this;
     if (c.indexOf('AT') === 0) {
       var a = c.slice(2);
-      if (a === 'Z') { this.echo = true; this.spaces = true; this.headers = false; return '\r\rELM327 v1.5'; }
+      if (a === 'Z' || a === 'D') { this.echo = true; this.spaces = true; this.headers = false; this.txHeader = '7DF'; this.rxFilter = null; if (a === 'D') return 'OK'; return '\r\rELM327 v1.5'; }
+      if (/^SH[0-9A-F]{3}$/.test(a)) { this.txHeader = a.slice(2); this.headerLog.push('ATSH' + this.txHeader); return this.opts.rejectSh ? '?' : 'OK'; }
+      if (/^CRA[0-9A-FX]{0,3}$/.test(a)) { this.rxFilter = a.length > 3 ? a.slice(3) : null; this.headerLog.push(a.length > 3 ? 'ATCRA' + this.rxFilter : 'ATCRA'); return this.opts.rejectCra ? '?' : 'OK'; }
       if (a === 'I') return 'ELM327 v1.5';
       if (a === '@1') return 'OBDII to RS232 Interpreter';
       if (a === 'E0') { this.echo = false; return 'OK'; }
@@ -776,6 +782,23 @@
     var body = c;
     if (body.length % 2 === 1) body = body.slice(0, -1); // strip "1" response-count suffix
     var mode = body.slice(0, 2), rest = body.slice(2);
+    if (mode === '21' || mode === '22') {
+      if (this.txHeader !== '7E1' || mode !== '21' || rest !== '03' || !this.tcm) return 'NO DATA';
+      if (this.tcm === 'hang') return null;
+      // 61 03 + 20 data bytes; data[13] (Torque "N") is the fluid temperature thermistor count
+      var sim = this._sim();
+      var n = Math.round(Math.min(200, 60 + sim.run * 0.5)); // ~28 C at start, warming
+      if (this.opts.tcmByteN != null) n = this.opts.tcmByteN;
+      var data = [];
+      for (var di = 0; di < 20; di++) data.push(di === 13 ? n : (0x10 + di));
+      if (this.tcm === 'short') data = data.slice(0, 8);
+      var hexs = '6103' + data.map(hx).join('');
+      var bb2 = hexs.match(/../g), ls2 = [hx2(bb2.length).slice(1)], j2 = 6, sq2 = 0;
+      ls2.push('0: ' + self._fmt(bb2.slice(0, 6).join('')));
+      while (j2 < bb2.length) { sq2++; var ch2 = bb2.slice(j2, j2 + 7); while (ch2.length < 7) ch2.push('00'); ls2.push(sq2.toString(16).toUpperCase() + ': ' + self._fmt(ch2.join(''))); j2 += 7; }
+      return ls2.join('\r');
+    }
+    if (this.txHeader !== '7DF' && this.txHeader !== '7E0') return 'NO DATA'; // mode 01 etc. only answered by the ECU
     if (mode === '03' || mode === '07' || mode === '0A') {
       var list = this.dtcs[mode] || [];
       var resp = hx(parseInt(mode, 16) + 0x40) + hx(list.length) + list.join('');
@@ -866,6 +889,7 @@
     return new Promise(function (resolve) {
       self.pending = {
         resolve: function (text) { resolve({ ok: true, text: text }); },
+        abort: function (why) { resolve({ ok: false, text: self.buffer, aborted: why || 'ABORTED' }); },
         timer: setTimeout(function () { self.pending = null; resolve({ ok: false, text: self.buffer }); }, ms)
       };
       self._check(); // reply may already have arrived while the write was still completing
@@ -901,7 +925,11 @@
     this.lastLatency = Date.now() - started;
     this.busy = false;
     if (r.ok) job.resolve(r.text);
-    else {
+    else if (r.aborted) {
+      this.log('warn', 'Abandoned in-flight ' + label + ' after ' + this.lastLatency + 'ms (' + r.aborted + ')');
+      this.afterTimeout = true; // let a late prompt drain before the next command
+      var ab = new Error(r.aborted === 'CANCELLED' ? 'CANCELLED' : 'TIMEOUT'); ab.partial = r.text; ab.aborted = r.aborted; job.reject(ab);
+    } else {
       this.log('warn', 'Timeout after ' + this.lastLatency + 'ms (no prompt) for ' + label + (r.text ? ' (partial: ' + JSON.stringify(r.text) + ')' : ' (no RX at all)'));
       this.afterTimeout = true;
       var err = new Error('TIMEOUT'); err.partial = r.text; job.reject(err);
@@ -909,11 +937,24 @@
     this._pump();
   };
 
+  /**
+   * v1.7.0: give up on the command currently waiting for its prompt (e.g. it went stale while Chrome was in the
+   * background). The waiting job rejects with TIMEOUT (aborted) and the queue keeps running, so nothing deadlocks.
+   */
+  ElmSession.prototype.abortPending = function (why) {
+    var p = this.pending;
+    if (!p) return false;
+    this.pending = null;
+    if (p.timer) clearTimeout(p.timer);
+    if (p.abort) p.abort(why || 'ABORTED');
+    return true;
+  };
+
   ElmSession.prototype.clearQueue = function (reason) {
     var q = this.queue; this.queue = [];
-    if (this.pending && this.pending.timer) clearTimeout(this.pending.timer);
-    this.pending = null;
     q.forEach(function (j) { j.reject(reason || new Error('CANCELLED')); });
+    // Release the in-flight wait too (v1.6 only cleared its timer, which could leave the pump busy forever).
+    this.abortPending('CANCELLED');
   };
 
   var api = { BleTransport: BleTransport, MockTransport: MockTransport, ElmSession: ElmSession, BLE_PROFILES: BLE_PROFILES, OPTIONAL_SERVICES: OPTIONAL_SERVICES, withTimeout: withTimeout, VARIANTS: VARIANTS, formatBytes: formatBytes, shortUuid: shortUuid, uuid16: uuid16, isBusyError: isBusyError };
