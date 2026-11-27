@@ -84,11 +84,48 @@
   // Non-display PIDs whose lengths we still need when parsing multi-PID responses.
   var LENGTH_ONLY = { '00': 4, '20': 4, '40': 4, '60': 4, '80': 4, 'A0': 4, 'C0': 4, '01': 4, '02': 2, '03': 2, '12': 1, '13': 1, '1C': 1, '1D': 1, '1E': 1, '41': 4, '51': 1 };
 
+  // ---- v1.7.0: read-only enhanced (manufacturer) PIDs ----
+  // Polled with a mode 21/22 request on a specific module header. Never written to.
+  // decode(dataBytes) gets the bytes AFTER the positive-reply echo (61 03 ...); dataBytes[0] is Torque's "A".
+  // Mitsubishi CVT fluid temperature, 2013 Lancer (Jatco JF011E / F1CJA TCM at 7E1, replies on 7E9).
+  // Request 2103; temperature byte = Torque "N" = dataBytes[13]. EXPERIMENTAL: offsets vary by TCM firmware.
+  // Sources (community Torque lists, not factory data):
+  //   out-club.ru Outlander III Torque thread (OUT3.csv): "(Out3) CVT temp" 2103 / 7E1 / 5th-order polynomial on N,
+  //     "(Out3 CVT8) CVT Temperature" 2103 / 7E1 / N-55 (newer JF016E CVT8), start cmds atsh7E1 + atcra7E9.
+  //   elm3.ru Mitsubishi_Outlander_2008-2015.csv: same 2103 / 7E1 polynomial ("CVT temp 1").
+  //   drive2.ru "PID температуры АКПП Lancer X": Lancer X owners report the polynomial family on older CVTs and N-55 on the newer one.
+  function cvtPoly(N) {
+    return 0.000000002344 * Math.pow(N, 5) - 0.000001387 * Math.pow(N, 4) + 0.0003193 * Math.pow(N, 3) - 0.03501 * N * N + 2.302 * N - 36.6;
+  }
+  var CVT_REQ = { mode: '21', request: '2103', txHeader: '7E1', rxFilter: '7E9', minBytes: 14 };
+  var ENHANCED = [
+    Object.assign({ pid: 'MCVT', name: 'CVT fluid temperature (Exp)', short: 'CVT temp (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -40, max: 150,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'polynomial on N (JF011E)',
+      decode: function (d) { return d.length > 13 ? cvtPoly(d[13]) : null; } }, CVT_REQ),
+    Object.assign({ pid: 'MCVT8', name: 'CVT temp alt N-55 (Exp, JF016E formula)', short: 'CVT N-55 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -55, max: 200,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'N - 55 (CVT8)',
+      decode: function (d) { return d.length > 13 ? d[13] - 55 : null; } }, CVT_REQ),
+    Object.assign({ pid: 'MCVTN', name: 'CVT temp raw byte N (Exp)', short: 'CVT raw N (Exp)', bytes: 0, unit: '', kind: 'none', min: 0, max: 255,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'raw N',
+      decode: function (d) { return d.length > 13 ? d[13] : null; } }, CVT_REQ)
+  ];
+
   var BY_PID = {};
   DEFS.forEach(function (d) { BY_PID[d.pid] = d; });
+  ENHANCED.forEach(function (d) { BY_PID[d.pid] = d; });
 
   function get(pid) { return BY_PID[String(pid).toUpperCase()] || null; }
-  function length(pid) { var d = get(pid); if (d) return d.bytes; var k = String(pid).toUpperCase(); return LENGTH_ONLY[k] != null ? LENGTH_ONLY[k] : null; }
+  function isEnhanced(pid) { var d = get(pid); return !!(d && d.enhanced); }
+  /** Label used in CSV headers / editor: "[010C]" for mode 01, "[7E1:2103]" for enhanced. */
+  function code(pid) { var d = get(pid); return d && d.enhanced ? d.txHeader + ':' + d.request : '01' + String(pid).toUpperCase(); }
+  /** Decode an enhanced PID from the data bytes after the 61 xx echo. */
+  function decodeEnhanced(pid, dataBytes) {
+    var d = get(pid);
+    if (!d || !d.enhanced || !dataBytes || dataBytes.length < (d.minBytes || 1)) return null;
+    var v = d.decode(dataBytes);
+    return v == null || isNaN(v) ? null : Math.round(v * 1000) / 1000;
+  }
+  function length(pid) { var d = get(pid); if (d && !d.enhanced) return d.bytes; var k = String(pid).toUpperCase(); return LENGTH_ONLY[k] != null ? LENGTH_ONLY[k] : null; }
 
   /** Decode a PID's data bytes to a metric number. */
   function decode(pid, bytes) {
@@ -118,10 +155,20 @@
   }
 
   /** PIDs from a profile that we will actually poll: known to the library and, if given, reported as supported. */
-  function pollList(wanted, supported) {
+  function pollList(wanted, supported, enhancedNS) {
     return (wanted || []).filter(function (x) {
-      return get(x) && (!supported || supported.indexOf(x) >= 0);
+      var d = get(x);
+      if (!d) return false;
+      if (d.enhanced) return !(enhancedNS && enhancedNS[d.pid]);
+      return !supported || supported.indexOf(x) >= 0;
     });
+  }
+  /** Is this PID available on the connected car? Enhanced PIDs count as supported until they fail. */
+  function isSupported(pid, supported, enhancedNS) {
+    var d = get(pid);
+    if (!d) return false;
+    if (d.enhanced) return !(enhancedNS && enhancedNS[d.pid]);
+    return !supported || supported.indexOf(d.pid) >= 0;
   }
 
   function unitFor(pid, system) { return toDisplay(pid, 0, system).unit; }
@@ -134,7 +181,7 @@
     return v.toFixed(dp);
   }
 
-  var CATEGORIES = ['Engine', 'Temperatures', 'Fuel', 'Air', 'O2 / Catalyst', 'Electrical', 'Emissions', 'Status'];
+  var CATEGORIES = ['Engine', 'Temperatures', 'Fuel', 'Air', 'O2 / Catalyst', 'Electrical', 'Emissions', 'Status', 'Mitsubishi CVT (Exp)'];
 
   var PRESETS = [
     { id: 'preset-quick', name: 'Quick look', pids: ['0C', '0D', '05', '04', '42', '11'] },
@@ -142,9 +189,10 @@
     { id: 'preset-fuel', name: 'Fuel trims', pids: ['06', '07', '08', '09', '14', '15', '10', '0C', '04', '05'] },
     { id: 'preset-air', name: 'Air intake', pids: ['10', '0B', '0F', '33', '11', '0C', '04'] },
     { id: 'preset-cat', name: 'O2 / Catalyst', pids: ['14', '15', '18', '19', '3C', '3E', '06', '07', '0C'] },
-    { id: 'preset-elec', name: 'Charging / electrical', pids: ['42', '0C', '04', '05'] }
+    { id: 'preset-elec', name: 'Charging / electrical', pids: ['42', '0C', '04', '05'] },
+    { id: 'preset-mitsu-cvt', name: 'Mitsubishi CVT (Experimental)', pids: ['MCVT', 'MCVT8', 'MCVTN', '05', '0C'], experimental: true }
   ];
 
-  var api = { DEFS: DEFS, CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
+  var api = { DEFS: DEFS, ENHANCED: ENHANCED, ALL: DEFS.concat(ENHANCED), CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, isEnhanced: isEnhanced, isSupported: isSupported, code: code, decodeEnhanced: decodeEnhanced, cvtPoly: cvtPoly, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.PIDS = api;
 })(this);

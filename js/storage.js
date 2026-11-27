@@ -9,10 +9,24 @@
   }
   function saveSettings(s) { localStorage.setItem(LS_SETTINGS, JSON.stringify(s)); }
 
+  var LS_PRESETS_SEEN = 'obd.presetsSeen.v1';
   function loadProfiles() {
     var raw = localStorage.getItem(LS_PROFILES);
-    if (!raw) { var p = JSON.parse(JSON.stringify(root.PIDS.PRESETS)); saveProfiles(p); return p; }
-    try { return JSON.parse(raw); } catch (e) { return JSON.parse(JSON.stringify(root.PIDS.PRESETS)); }
+    var all = root.PIDS.PRESETS.map(function (p) { return p.id; });
+    if (!raw) { var p = JSON.parse(JSON.stringify(root.PIDS.PRESETS)); saveProfiles(p); localStorage.setItem(LS_PRESETS_SEEN, JSON.stringify(all)); return p; }
+    var list;
+    try { list = JSON.parse(raw); } catch (e) { return JSON.parse(JSON.stringify(root.PIDS.PRESETS)); }
+    // v1.7.0: add presets introduced after this phone first ran the app (once; a preset you delete stays deleted).
+    var seen;
+    try { seen = JSON.parse(localStorage.getItem(LS_PRESETS_SEEN) || 'null'); } catch (e) { seen = null; }
+    if (!seen) seen = ['preset-quick', 'preset-cooling', 'preset-fuel', 'preset-air', 'preset-cat', 'preset-elec'];
+    var added = false;
+    root.PIDS.PRESETS.forEach(function (pr) {
+      if (seen.indexOf(pr.id) < 0 && !list.some(function (x) { return x.id === pr.id; })) { list.push(JSON.parse(JSON.stringify(pr))); added = true; }
+    });
+    if (added) saveProfiles(list);
+    localStorage.setItem(LS_PRESETS_SEEN, JSON.stringify(all));
+    return list;
   }
   function saveProfiles(list) { localStorage.setItem(LS_PROFILES, JSON.stringify(list)); }
   function restorePresets(list) {
@@ -76,6 +90,39 @@
     });
   }
 
+  /**
+   * v1.7.0: in-memory buffer for recorded rows. One IndexedDB transaction per batch instead of per poll:
+   * flushes every maxRows samples or every intervalMs, and on demand (Stop recording, tab hidden, pagehide).
+   * Flushes are chained so two transactions never race; a failed write puts the rows back for the next try.
+   */
+  function createRowBuffer(opts) {
+    opts = opts || {};
+    var write = opts.write || addRows;
+    var maxRows = opts.maxRows || 25, intervalMs = opts.intervalMs != null ? opts.intervalMs : 3000;
+    var onError = opts.onError || function () {};
+    var onFlushed = opts.onFlushed || function () {};
+    var buf = [], chain = Promise.resolve(), timer = null, stopped = false;
+    var stats = { flushes: 0, rows: 0 };
+    function flush(reason) {
+      var rows = buf; buf = []; // snapshot now, so each batch is its own transaction
+      chain = chain.then(function () {
+        if (!rows.length) return;
+        return Promise.resolve(write(rows)).then(function () {
+          stats.flushes++; stats.rows += rows.length; onFlushed(rows.length, reason || 'manual');
+        }, function (e) { buf = rows.concat(buf); onError(e); });
+      });
+      return chain;
+    }
+    function push(row) {
+      if (stopped) return;
+      buf.push(row);
+      if (buf.length >= maxRows) flush('batch');
+    }
+    if (intervalMs > 0) timer = setInterval(function () { flush('timer'); }, intervalMs);
+    function stop() { stopped = true; if (timer) clearInterval(timer); timer = null; return flush('stop'); }
+    return { push: push, flush: flush, stop: stop, pending: function () { return buf.length; }, stats: stats };
+  }
+
   root.Store = { loadSettings: loadSettings, saveSettings: saveSettings, loadProfiles: loadProfiles, saveProfiles: saveProfiles, restorePresets: restorePresets,
-    putSession: putSession, addRows: addRows, listSessions: listSessions, getRows: getRows, deleteSession: deleteSession };
+    putSession: putSession, addRows: addRows, createRowBuffer: createRowBuffer, listSessions: listSessions, getRows: getRows, deleteSession: deleteSession };
 })(this);
