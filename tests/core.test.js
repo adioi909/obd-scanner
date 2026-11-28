@@ -174,3 +174,167 @@ test('multi-PID fallback when adapter cannot do it', async () => {
   assert.equal(typeof v['0C'], 'number');
   assert.equal(typeof v['05'], 'number');
 });
+
+// ---- v1.4: realistic 2013 Mitsubishi / this-clone replies (no spaces, no headers, ISO-TP like the hardware 0902) ----
+const MITSU_VIN = '014\r0: 4902014A4133\r1: 32553246553944\r2: 55303130343736\r\r>';
+const MITSU_0100 = '4100BE3FA813\r\r>';
+const MITSU_0120 = '41209017E001\r\r>';
+const MITSU_0140 = '4140FED00040\r\r>';
+const MITSU_0101 = '41010007E500\r\r>';
+
+test('v1.4: exact hardware VIN / support / monitor replies decode (no spaces, colon-space ISO-TP, prompt split off)', () => {
+  assert.equal(ELM.parseVin(MITSU_VIN), 'JA32U2FU9DU010476');
+  const s00 = ELM.parsePidResponse(MITSU_0100, 1, PIDS.length, '0100')['00'];
+  const s20 = ELM.parsePidResponse(MITSU_0120, 1, PIDS.length, '0120')['20'];
+  const s40 = ELM.parsePidResponse(MITSU_0140, 1, PIDS.length, '0140')['40'];
+  assert.ok(s00 && s20 && s40);
+  const all = ELM.decodeSupported(s00, 0).concat(ELM.decodeSupported(s20, 0x20), ELM.decodeSupported(s40, 0x40));
+  assert.equal(all.length, 39);
+  ['0C', '0D', '05', '04', '42', '11', '15', '06', '07'].forEach((p) => assert.ok(all.map(n => ELM.toHex(n)).includes(p), p));
+  ['14', '18', '19', '3C', '3E'].forEach((p) => assert.ok(!all.map(n => ELM.toHex(n)).includes(p), 'unsupported ' + p));
+  const mon = DTC.parseMonitorStatus(ELM.parsePidResponse(MITSU_0101, 1, PIDS.length, '0101')['01']);
+  assert.equal(mon.mil, false);
+  assert.equal(mon.count, 0);
+});
+
+test('v1.4: unspaced multi-frame multi-PID (ISO-TP 0:/1:/2: like 0902) and single-PID decode', () => {
+  // 16-byte payload for 010C0D05044211: 41 0C 1A F8 0D 32 05 7B 04 80 42 37 14 11 40
+  const raw = '00F\r0: 410C1AF80D32\r1: 057B0480423714\r2: 1140\r\r>';
+  const p = ELM.parsePidResponse(raw, 1, PIDS.length, '010C0D05044211');
+  assert.deepEqual(p['0C'], [0x1A, 0xF8]);
+  assert.deepEqual(p['0D'], [0x32]);
+  assert.deepEqual(p['05'], [0x7B]);
+  assert.deepEqual(p['04'], [0x80]);
+  assert.deepEqual(p['42'], [0x37, 0x14]);
+  assert.deepEqual(p['11'], [0x40]);
+  near(PIDS.decode('0C', p['0C']), 1726);
+  near(PIDS.decode('42', p['42']), 14.1);
+  // single-PID, no spaces, prompt in a second notification already joined by the session
+  assert.deepEqual(ELM.parsePidResponse('410C1AF8\r\r>', 1, PIDS.length, '010C'), { '0C': [0x1A, 0xF8] });
+  assert.deepEqual(ELM.parsePidResponse('410C1AF8\r\r>', 1, PIDS.length, '010C1'), { '0C': [0x1A, 0xF8] });
+});
+
+test('v1.4: queryPids falls back to single-PID when a multi-PID request hangs (timeout) and logs why', async () => {
+  const logs = [];
+  const mock = new MockTransport({ latency: 1, multiPidHang: true, splitPrompt: true, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 200 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), pidTimeout: 80 });
+  await obd.init('0');
+  assert.equal(obd.isCan, true);
+  const v = await obd.queryPids(['0C', '0D', '05', '04', '42', '11']);
+  assert.equal(obd.multiPid, false);
+  for (const p of ['0C', '0D', '05', '04', '42', '11']) assert.equal(typeof v[p], 'number', p + ' ' + v[p]);
+  assert.ok(logs.some(l => /Live 010C0D05044211 -> TIMEOUT/.test(l)));
+  assert.ok(logs.some(l => /falling back to single-PID/.test(l)));
+  assert.ok(logs.some(l => /Live 010C1 -> /.test(l) || /Live 010C -> /.test(l)));
+});
+
+test('v1.4: mitsubishi mock fixtures (39 PIDs, VIN, pending P0420, MIL off) and split-notification multi-frame live data', async () => {
+  const logs = [];
+  const mock = new MockTransport({ latency: 1, splitPrompt: true, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 400 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), pidTimeout: 300 });
+  const info = await obd.init('0');
+  assert.equal(info.adapterOk, true);
+  assert.equal(info.ecuOk, true);
+  assert.equal(info.protocolNum, '6');
+  assert.equal(info.voltage, '14.6V');
+  assert.match(info.elm, /ELM327 V1\.5/i);
+  const sup = await obd.readSupported();
+  assert.equal(sup.length, 39);
+  assert.equal(await obd.readVin(), 'JA32U2FU9DU010476');
+  const mon = await obd.readMonitor();
+  assert.equal(mon.mil, false);
+  assert.equal(mon.count, 0);
+  const d = await obd.readDtcs();
+  assert.deepEqual(d.stored.codes, []);
+  assert.deepEqual(d.pending.codes, ['P0420']);
+  const v = await obd.queryPids(['0C', '0D', '05', '04', '42', '11']);
+  for (const p of ['0C', '0D', '05', '04', '42', '11']) assert.equal(typeof v[p], 'number', p);
+  assert.ok(obd.multiPid, 'multi-PID should stay on when the mock returns a valid ISO-TP reply');
+  assert.ok(logs.some(l => /Live 010C0D05044211 -> /.test(l)));
+});
+
+test('v1.6: exact hardware single-PID live replies (with fast-response "1" suffix) all decode', () => {
+  const cases = [
+    ['010C1', '410C0B0C\r\r>', '0C', 707],
+    ['010C1', '410C0ADD\r\r>', '0C', 695.25],
+    ['010C1', '410C0B1B\r\r>', '0C', 710.75],
+    ['01151', '41151C80\r\r>', '15', 0.14],
+    ['01151', '41151C81\r\r>', '15', 0.14],
+    ['01061', '410680\r\r>', '06', 0],
+    ['01061', '410681\r\r>', '06', 0.78125],
+    ['01071', '410781\r\r>', '07', 0.78125]
+  ];
+  for (const [cmd, raw, pid, want] of cases) {
+    const parsed = ELM.parsePidResponse(raw, 1, PIDS.length, cmd);
+    assert.ok(parsed[pid], cmd + ' ' + raw + ' -> ' + JSON.stringify(parsed));
+    near(PIDS.decode(pid, parsed[pid]), want, 0.02);
+  }
+});
+
+test('v1.6: ElmSession reassembles a split 01151 reply (41151C8 + 1\\r\\r>) and queryPids returns it', async () => {
+  const sent = [];
+  const t = { write: async (s) => { sent.push(s); setTimeout(() => { t.onData('41151C8'); }, 5); setTimeout(() => { t.onData('1\r\r>'); }, 12); } };
+  const sess = new ElmSession(t, { timeout: 200 });
+  const raw = await sess.send('01151');
+  assert.equal(raw.replace(/\s/g, ''), '41151C81');
+  const parsed = ELM.parsePidResponse(raw, 1, PIDS.length, '01151');
+  near(PIDS.decode('15', parsed['15']), 0.14, 0.02);
+});
+
+test('v1.6: pollList keeps every supported Quick look and Air intake PID for this car (does not drop 0D/05/04/42/11/10/0B/0F/33)', () => {
+  const s00 = ELM.parsePidResponse('4100BE3FA813\r\r>', 1, PIDS.length, '0100')['00'];
+  const s20 = ELM.parsePidResponse('41209017E001\r\r>', 1, PIDS.length, '0120')['20'];
+  const s40 = ELM.parsePidResponse('4140FED00040\r\r>', 1, PIDS.length, '0140')['40'];
+  const supported = ELM.decodeSupported(s00, 0).concat(ELM.decodeSupported(s20, 0x20), ELM.decodeSupported(s40, 0x40)).map(n => ELM.toHex(n));
+  const quick = PIDS.PRESETS.find(p => p.id === 'preset-quick').pids;
+  const air = PIDS.PRESETS.find(p => p.id === 'preset-air').pids;
+  const cat = PIDS.PRESETS.find(p => p.id === 'preset-cat').pids;
+  assert.deepEqual(PIDS.pollList(quick, supported), quick);
+  assert.deepEqual(PIDS.pollList(air, supported), air);
+  // O2 / Catalyst: 14/18/19/3C/3E are not supported; 15/06/07/0C are
+  assert.deepEqual(PIDS.pollList(cat, supported), ['15', '06', '07', '0C']);
+  // A mid-live profile switch is just "call pollList again with the new profile"
+  let current = 'preset-cat';
+  const list = () => PIDS.pollList(PIDS.PRESETS.find(p => p.id === current).pids, supported);
+  assert.deepEqual(list(), ['15', '06', '07', '0C']);
+  current = 'preset-quick';
+  assert.deepEqual(list(), quick);
+  current = 'preset-air';
+  assert.deepEqual(list(), air);
+});
+
+test('v1.6: mitsubishi mock, single-PID + "1" suffix (as in the v1.5 log): every Quick look and Air intake PID gets a value', async () => {
+  const logs = [];
+  const mock = new MockTransport({ latency: 1, splitPrompt: true, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 400 });
+  const obd = new Obd(s, { log: (k, m) => logs.push(k + ': ' + m), pidTimeout: 300, multiPid: false, fastResponse: true });
+  const info = await obd.init('0');
+  assert.equal(info.ecuOk, true);
+  const sup = await obd.readSupported();
+  const quick = PIDS.pollList(PIDS.PRESETS.find(p => p.id === 'preset-quick').pids, sup);
+  const air = PIDS.pollList(PIDS.PRESETS.find(p => p.id === 'preset-air').pids, sup);
+  const qv = await obd.queryPids(quick);
+  for (const p of quick) assert.equal(typeof qv[p], 'number', 'quick ' + p);
+  const av = await obd.queryPids(air);
+  for (const p of air) assert.equal(typeof av[p], 'number', 'air ' + p);
+  assert.ok(logs.some(l => /Live 010C1 -> /.test(l)));
+  assert.ok(logs.some(l => /Live 010D1 -> /.test(l) || /Live 0105 1/.test(l) || /Live 01051 -> /.test(l)));
+});
+
+test('v1.6.1: readFreezeFrame returns null when the ECU has no stored (confirmed) DTC', async () => {
+  const mock = new MockTransport({ latency: 1, car: 'mitsubishi2013' });
+  await mock.connect();
+  const s = new ElmSession(mock, { timeout: 400 });
+  const obd = new Obd(s, { pidTimeout: 300 });
+  await obd.init('0');
+  await obd.readSupported();
+  const d = await obd.readDtcs();
+  assert.deepEqual(d.stored.codes, []);
+  assert.deepEqual(d.pending.codes, ['P0420']);
+  assert.equal(await obd.readFreezeFrame(), null);
+});

@@ -100,12 +100,15 @@
   /** "CVT temp 2" cubic from the elm3.ru / out-club Outlander CSV (same byte N as the polynomial). */
   function cvtCubic(N) { return 0.0000286 * N * N * N - 0.00951 * N * N + 1.46 * N - 30.1; }
   // slowTimeout: while polling the TCM the app uses a long ELM timeout (ATSTFF, adaptive timing off) and restores ATST32 / ATAT1 afterwards.
-  var CVT_REQ = { mode: '21', request: '2103', txHeader: '7E1', rxFilter: '7E9', minBytes: 14, slowTimeout: true };
+  // flowControl: Torque's Mitsubishi recipe (ATFCSH + ATFCSD30080A + ATFCSM1) while this request is in flight. Read-only adapter setup.
+  var CVT_REQ = { mode: '21', request: '2103', txHeader: '7E1', rxFilter: '7E9', minBytes: 14, slowTimeout: true, flowControl: true };
   // v1.7.1 research candidates (see docs/cvt-research.md): other 7E1 service-21 reads that may carry a fluid temperature.
   //   2133: first data byte A, A-50 (Pelican/OBDb Lancer 2015, single short frame). 2102: 6th data byte (Torque letter F), F-40 (Pelican Lancer 2015/2019; Pajero 21 02 -40).
   //   2103 byte J (10th data byte), J-55 (Pelican "AT ATF temp"; same as the Out3 3.0 "AT Temp" J-55).
-  var CVT33_REQ = { mode: '21', request: '2133', txHeader: '7E1', rxFilter: '7E9', minBytes: 1, slowTimeout: true };
-  var CVT02_REQ = { mode: '21', request: '2102', txHeader: '7E1', rxFilter: '7E9', minBytes: 6, slowTimeout: true };
+  // v1.7.2: ScanGauge "CVT" X-Gauge TXD 07E12122, RXD 2808 (first data byte on CAN, same slot as mode-01 "A"), MTH 00090005FFBD = (x-55) °C.
+  var CVT33_REQ = { mode: '21', request: '2133', txHeader: '7E1', rxFilter: '7E9', minBytes: 1, slowTimeout: true, flowControl: true };
+  var CVT02_REQ = { mode: '21', request: '2102', txHeader: '7E1', rxFilter: '7E9', minBytes: 6, slowTimeout: true, flowControl: true };
+  var CVT22_REQ = { mode: '21', request: '2122', txHeader: '7E1', rxFilter: '7E9', minBytes: 1, slowTimeout: true, flowControl: true };
   var ENHANCED = [
     Object.assign({ pid: 'MCVT', name: 'CVT fluid temperature (Exp)', short: 'CVT temp (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -40, max: 150,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'polynomial on N (JF011E)',
@@ -116,6 +119,9 @@
     Object.assign({ pid: 'MCVT33', name: 'CVT temp 2133 A-50 (Exp)', short: 'CVT 2133 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -50, max: 205,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 0, formula: 'A - 50 (request 2133)',
       decode: function (d) { return d.length > 0 ? d[0] - 50 : null; } }, CVT33_REQ),
+    Object.assign({ pid: 'MCVT22', name: 'CVT temp 2122 A-55 (Exp, ScanGauge)', short: 'CVT 2122 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -55, max: 200,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 0, formula: 'A - 55 (request 2122)',
+      decode: function (d) { return d.length > 0 ? d[0] - 55 : null; } }, CVT22_REQ),
     Object.assign({ pid: 'MCVT02', name: 'CVT temp 2102 F-40 (Exp)', short: 'CVT 2102 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -40, max: 215,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 5, formula: 'F - 40 (request 2102)',
       decode: function (d) { return d.length > 5 ? d[5] - 40 : null; } }, CVT02_REQ),
@@ -203,6 +209,35 @@
 
   var CATEGORIES = ['Engine', 'Temperatures', 'Fuel', 'Air', 'O2 / Catalyst', 'Electrical', 'Emissions', 'Status', 'Mitsubishi CVT (Exp)'];
 
+  /** Experimental best-effort CVT temperature. Does not invent a value: it only ranks numbers the TCM actually returned.
+   *  Prefer the candidate closest to coolant (PID 05, °C) when that is present; otherwise the earlier source in CVT_PICK.
+   *  Returns { pid, label, value } or null. */
+  var CVT_PICK = [
+    { pid: 'MCVT22', label: '2122 A-55 (ScanGauge)' },
+    { pid: 'MCVT33', label: '2133 A-50' },
+    { pid: 'MCVT02', label: '2102 F-40' },
+    { pid: 'MCVT8', label: '2103 N-55' },
+    { pid: 'MCVT3', label: '2103 cubic' },
+    { pid: 'MCVT', label: '2103 polynomial' },
+    { pid: 'MCVTJ', label: '2103 J-55' }
+  ];
+  function pickCvt(values) {
+    if (!values) return null;
+    var cool = values['05'], cands = [];
+    CVT_PICK.forEach(function (c, i) {
+      var v = values[c.pid];
+      if (v == null || isNaN(v) || v < -30 || v > 150) return;
+      cands.push({ pid: c.pid, label: c.label, value: v, rank: i, dist: typeof cool === 'number' ? Math.abs(v - cool) : null });
+    });
+    if (!cands.length) return null;
+    cands.sort(function (a, b) {
+      if (a.dist != null && b.dist != null && a.dist !== b.dist) return a.dist - b.dist;
+      return a.rank - b.rank;
+    });
+    return { pid: cands[0].pid, label: cands[0].label, value: cands[0].value };
+  }
+
+  var CVT_PIDS = ['MCVT33', 'MCVT22', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C'];
   var PRESETS = [
     { id: 'preset-quick', name: 'Quick look', pids: ['0C', '0D', '05', '04', '42', '11'] },
     { id: 'preset-cooling', name: 'Cooling system', pids: ['05', '0F', '46', '5C', '0C', '0D', '04', '42'] },
@@ -210,13 +245,14 @@
     { id: 'preset-air', name: 'Air intake', pids: ['10', '0B', '0F', '33', '11', '0C', '04'] },
     { id: 'preset-cat', name: 'O2 / Catalyst', pids: ['14', '15', '18', '19', '3C', '3E', '06', '07', '0C'] },
     { id: 'preset-elec', name: 'Charging / electrical', pids: ['42', '0C', '04', '05'] },
-    { id: 'preset-mitsu-cvt', name: 'Mitsubishi CVT (Experimental)', pids: ['MCVT33', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C'], experimental: true }
+    { id: 'preset-mitsu-cvt', name: 'Mitsubishi CVT (Experimental)', pids: CVT_PIDS, experimental: true }
   ];
-  // v1.7.1: when a stored preset still has exactly the old default list, replace it with the new one (edited presets are never touched).
+  // When a stored preset still has exactly an older default list, replace it (edited presets are never touched).
   var PRESET_UPGRADES = [
-    { id: 'preset-mitsu-cvt', from: ['MCVT', 'MCVT8', 'MCVTN', '05', '0C'], to: PRESETS.filter(function (p) { return p.id === 'preset-mitsu-cvt'; })[0].pids.slice() }
+    { id: 'preset-mitsu-cvt', from: ['MCVT', 'MCVT8', 'MCVTN', '05', '0C'], to: CVT_PIDS.slice() },
+    { id: 'preset-mitsu-cvt', from: ['MCVT33', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C'], to: CVT_PIDS.slice() }
   ];
 
-  var api = { DEFS: DEFS, ENHANCED: ENHANCED, ALL: DEFS.concat(ENHANCED), CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, isEnhanced: isEnhanced, isSupported: isSupported, code: code, decodeEnhanced: decodeEnhanced, cvtPoly: cvtPoly, cvtCubic: cvtCubic, PRESET_UPGRADES: PRESET_UPGRADES, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
+  var api = { DEFS: DEFS, ENHANCED: ENHANCED, ALL: DEFS.concat(ENHANCED), CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, isEnhanced: isEnhanced, isSupported: isSupported, code: code, decodeEnhanced: decodeEnhanced, cvtPoly: cvtPoly, cvtCubic: cvtCubic, pickCvt: pickCvt, PRESET_UPGRADES: PRESET_UPGRADES, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.PIDS = api;
 })(this);

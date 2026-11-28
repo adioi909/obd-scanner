@@ -167,7 +167,7 @@ test('v1.7: new presets are added once to existing profile lists; a deleted pres
 // ---------------- 5. enhanced PIDs + header switching ----------------
 test('v1.7: CVT preset is read-only, labelled (Exp), targets 7E1/7E9 with request 2103 and decodes byte N', () => {
   const pre = PIDS.PRESETS.find(p => p.id === 'preset-mitsu-cvt');
-  assert.deepEqual(pre.pids, ['MCVT33', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C']); // v1.7.1 adds candidate PIDs
+  assert.deepEqual(pre.pids, ['MCVT33', 'MCVT22', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C']); // v1.7.2 adds 2122
   for (const id of ['MCVT', 'MCVT8', 'MCVTN']) {
     const d = PIDS.get(id);
     assert.ok(/\(Exp/.test(d.short) && /\(Exp/.test(d.name), id);

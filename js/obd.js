@@ -202,6 +202,45 @@
     return true;
   };
 
+  /**
+   * v1.7.2: ISO-TP flow control. mode 0 = automatic (ATFCSM0). mode 1 = the Torque Mitsubishi recipe
+   * (ATFCSH + ATFCSD + ATFCSM1). A '?' from a clone is tolerated. This only changes how the adapter
+   * asks for the rest of a multi-frame reply; it does not write to the vehicle.
+   */
+  Obd.prototype.setFlowControl = async function (target) {
+    var st = this.adapter, cur = st.fcKnown ? st.fc : null;
+    var cmds = [];
+    if (target.mode === 1) {
+      if (!cur || cur.sh !== target.sh) cmds.push('ATFCSH' + target.sh);
+      if (!cur || cur.sd !== target.sd) cmds.push('ATFCSD' + target.sd);
+      if (!cur || cur.mode !== 1) cmds.push('ATFCSM1');
+    } else if (!cur || cur.mode !== 0) {
+      cmds.push('ATFCSM0');
+    }
+    for (var i = 0; i < cmds.length; i++) {
+      var r = '';
+      try { r = await this.cmd(cmds[i], 2000); }
+      catch (e) {
+        if (e.message === 'CANCELLED' || e.fatal) throw e;
+        st.fcKnown = false;
+        this.log('warn', 'Flow-control command ' + cmds[i] + ' failed: ' + e.message);
+        return false;
+      }
+      if (ELM.detectError(r, cmds[i]) === '?') this.log('warn', 'Adapter rejected ' + cmds[i] + ' (continuing)');
+    }
+    st.fc = { mode: target.mode, sh: target.mode === 1 ? target.sh : null, sd: target.mode === 1 ? target.sd : null };
+    st.fcKnown = true;
+    return true;
+  };
+
+  Obd.prototype.restoreDefaultFlow = async function () {
+    var f = this.adapter.fc;
+    if (this.adapter.fcKnown && f && f.mode === 0) return true;
+    var ok = await this.setFlowControl({ mode: 0 });
+    if (ok) this.log('info', 'Flow control restored to automatic (ATFCSM0)');
+    return ok;
+  };
+
   Obd.prototype.restoreDefaultTiming = async function () {
     var d = ELM.DEFAULT_TIMING, t = this.adapter.timing;
     if (this.adapter.timingKnown && t && t.st === d.st && t.at === d.at) return true;
@@ -223,7 +262,8 @@
       if (ok) this.log('info', 'Header restored to ' + ELM.DEFAULT_HEADER.tx + ' (receive filter cleared)');
     }
     var tOk = await this.restoreDefaultTiming();
-    return ok && tOk;
+    var fOk = await this.restoreDefaultFlow();
+    return ok && tOk && fOk;
   };
 
   /** v1.7.1: forget the 3-failure N/S verdicts so enhanced PIDs are tried again ("Retry CVT"). */
@@ -378,24 +418,32 @@
       var slow = g.reqOrder.some(function (rq0) { return g.reqs[rq0].some(function (p0) { return PIDS.get(p0).slowTimeout; }); });
       var wantT = slow ? { st: this.enhancedSt, at: 0 } : { st: ELM.DEFAULT_TIMING.st, at: ELM.DEFAULT_TIMING.at };
       await this.setTiming(wantT);
+      var wantFc = g.reqOrder.some(function (rq0) { return g.reqs[rq0].some(function (p0) { return PIDS.get(p0).flowControl; }); });
+      if (wantFc) await this.setFlowControl({ mode: 1, sh: g.header.tx, sd: '30080A' });
       var reqTimeout = Math.max(this._pidTimeout(), 1500, slow ? parseInt(this.enhancedSt, 16) * 4 + 1200 : 0);
+      // Failure counts stay on the header we started with, even if a retry clears the receive filter.
+      var failHeader = { tx: g.header.tx, rx: g.header.rx };
       for (var ri = 0; ri < g.reqOrder.length; ri++) {
         var rq = g.reqOrder[ri], members = g.reqs[rq];
-        var r = '', errName = null;
-        try { r = await this.cmd(rq, reqTimeout); }
-        catch (e) {
-          if (e.message === 'CANCELLED' || e.fatal) throw e;
-          errName = e.message; r = e.partial || '';
+        var attempt = await this._enhancedRequest(g.header, rq, reqTimeout);
+        // The car test that got NO DATA had ATCRA7E9 on. A clone that accepts the filter but drops 7E9 looks the same.
+        // One retry with the filter cleared, still read-only. Timeouts are not retried (the adapter never finished).
+        if (!attempt.data && g.header.rx && attempt.errName !== 'TIMEOUT') {
+          this.log('info', 'EXP ' + g.header.tx + '/' + g.header.rx + ' ' + rq + ' -> ' + (attempt.err || 'no positive reply') + '; clearing the receive filter and retrying once');
+          var cleared = await this.setHeader({ tx: g.header.tx, rx: null });
+          if (cleared) {
+            g.header.rx = null;
+            attempt = await this._enhancedRequest(g.header, rq, reqTimeout);
+          }
         }
         var tag = g.header.tx + (g.header.rx ? '/' + g.header.rx : '') + ' ' + rq;
-        var err = errName || ELM.detectError(r, rq);
-        var data = ELM.parseEnhancedResponse(r, rq);
-        if (!data) {
-          this.log('info', 'EXP ' + tag + ' -> ' + (err || 'no positive reply') + (r ? ' raw=' + livePreview(r) : ''));
-          this._enhancedFailed(g.header, rq, members, err || 'no positive reply');
+        if (!attempt.data) {
+          this.log('info', 'EXP ' + tag + ' -> ' + (attempt.err || 'no positive reply') + (attempt.raw ? ' raw=' + livePreview(attempt.raw) : ''));
+          this._enhancedFailed(failHeader, rq, members, attempt.err || 'no positive reply');
           continue;
         }
-        this.enhancedFails[ELM.headerKey(g.header) + '|' + rq] = 0;
+        this.enhancedFails[ELM.headerKey(failHeader) + '|' + rq] = 0;
+        var data = attempt.data;
         var parts = [];
         members.forEach(function (p) {
           var d = PIDS.get(p);
@@ -406,11 +454,22 @@
         var anyDef = PIDS.get(members[0]);
         var bi = anyDef.byteIndex;
         var byteNote = bi != null && data.length > bi ? (' | data[' + bi + '] (Torque ' + torqueLetter(bi) + ') = 0x' + ELM.toHex(data[bi]) + ' = ' + data[bi]) : (bi != null ? ' | reply too short for data[' + bi + ']' : '');
-        // Raw bytes always logged for experimental PIDs so the formula can be checked against a cold-start reading.
         this.log('info', 'EXP ' + tag + ' raw (' + data.length + ' data bytes): ' + ELM.bytesHex(data) + byteNote + ' -> ' + parts.join(', '));
       }
     }
     return out;
+  };
+
+  /** One enhanced request. errName is 'TIMEOUT' only when the adapter never returned a prompt. */
+  Obd.prototype._enhancedRequest = async function (header, rq, reqTimeout) {
+    var r = '', errName = null;
+    try { r = await this.cmd(rq, reqTimeout); }
+    catch (e) {
+      if (e.message === 'CANCELLED' || e.fatal) throw e;
+      errName = e.message; r = e.partial || '';
+    }
+    var err = errName || ELM.detectError(r, rq);
+    return { data: ELM.parseEnhancedResponse(r, rq), err: err, errName: errName, raw: r, header: header };
   };
 
   Obd.prototype._enhancedFailed = function (header, rq, members, why) {
