@@ -232,7 +232,7 @@ test('v1.7.1: 3-failure N/S fallback still works per request, and Retry CVT clea
   assert.equal(r.mock.cmdLog.filter(c => c === '2133').length, before, 'N/S PIDs are skipped');
   assert.equal(r.obd.clearEnhancedNS(), 2);
   await r.obd.queryPids(['MCVT33', 'MCVT'], { forceEnhanced: true });
-  assert.equal(r.mock.cmdLog.filter(c => c === '2133').length, before + 1, 'tried again after Retry CVT');
+  assert.equal(r.mock.cmdLog.filter(c => c === '2133').length, before + 2, 'tried again after Retry CVT (filter on, then once with the filter cleared)');
 });
 
 test('v1.7.1: a manual ATST / ATAT / ATFC command from the Console marks the adapter dirty and resync puts timing back', async () => {
@@ -278,12 +278,12 @@ test('v1.7.1: a stored CVT preset with the old default list is upgraded once; an
 
 test('v1.7.1: version strings, service worker cache, probe wired into the page', () => {
   const rd = f => fs.readFileSync(path.join(root, f), 'utf8');
-  assert.ok(/APP_VERSION = 'v1\.7\.1'/.test(rd('js/app.js')));
-  assert.ok(/<title>OBD Scanner v1\.7\.1<\/title>/.test(rd('index.html')) && /id="app-ver">v1\.7\.1</.test(rd('index.html')));
-  assert.ok(/CACHE = 'obd-scanner-v1\.7\.1'/.test(rd('sw.js')) && /js\/probe\.js/.test(rd('sw.js')));
-  assert.equal(JSON.parse(rd('package.json')).version, '1.7.1');
+  assert.ok(/APP_VERSION = 'v1\.7\.2'/.test(rd('js/app.js')));
+  assert.ok(/<title>OBD Scanner v1\.7\.2<\/title>/.test(rd('index.html')) && /id="app-ver">v1\.7\.2</.test(rd('index.html')));
+  assert.ok(/CACHE = 'obd-scanner-v1\.7\.2'/.test(rd('sw.js')) && /js\/probe\.js/.test(rd('sw.js')));
+  assert.equal(JSON.parse(rd('package.json')).version, '1.7.2');
   const html = rd('index.html');
-  ['btn-probe', 'btn-probe-copy', 'btn-probe-cancel', 'probe-summary', 'btn-retry-cvt', 's-cvtst', 'js/probe.js'].forEach(id => assert.ok(html.includes(id), id));
-  assert.ok(/Version 1\.7\.1/.test(rd('MANUAL.md')) && /v1\.7\.1/.test(rd('README.md')));
+  ['btn-probe', 'btn-probe-copy', 'btn-probe-cancel', 'probe-summary', 'btn-retry-cvt', 's-cvtst', 'js/probe.js', 'cvt-note'].forEach(id => assert.ok(html.includes(id), id));
+  assert.ok(/Version 1\.7\.2/.test(rd('MANUAL.md')) && /v1\.7\.2/.test(rd('README.md')));
   assert.ok(/CVT probe/i.test(rd('MANUAL.md')) && /Copy probe report/.test(rd('MANUAL.md')));
 });

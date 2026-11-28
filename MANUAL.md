@@ -1,6 +1,6 @@
 # OBD Scanner User Manual
 
-**Version 1.7.1**  
+**Version 1.7.2**  
 Field OBD-II scanner for Chrome on Android and a Bluetooth LE ELM327-style dongle.
 
 Live app: https://adioi909.github.io/obd-scanner/  
@@ -33,6 +33,7 @@ This manual describes what the app actually does. It does not invent features. N
 18. [CVT Probe (v1.7.1)](#18-cvt-probe-v1-7-1)
 19. [What changed in v1.7.1](#19-what-changed-in-v1-7-1)
 20. [What changed in v1.7.0](#20-what-changed-in-v1-7-0)
+21. [What changed in v1.7.2](#21-what-changed-in-v1-7-2)
 
 ---
 
@@ -638,10 +639,10 @@ Copy that log if neither formula matches.
 **v1.7.1 changes to the CVT preset.**
 
 - **Longer timeout on 7E1.** The first live test got NO DATA from the TCM although it is known to answer slowly. While the app is on the 7E1 header it now sends `ATAT0` (adaptive timing off) and `ATSTFF` (about 1 second, set under Settings, CVT timeout) and waits up to about 2.5 seconds for the reply. When it is done, success or not, it sends `ATAT1` and `ATST32` so ordinary polling is as fast as before. The Console banner and Re-run init also restore those.
-- **More candidate tiles.** The preset now starts with **CVT 2133 (Exp)** (request `2133`, last byte minus 50) and **CVT 2102 (Exp)** (request `2102`, 6th data byte minus 40), then the 2103 tiles: the polynomial, N−55, **CVT cubic (Exp)** and **CVT J−55 (Exp)** (10th data byte minus 55), and raw N. Each request is sent once per cycle and shared by its tiles. The list is only swapped in automatically if your saved preset still has the old default list; if you edited it, use Profiles → restore presets. Which request your TCM supports is exactly what the probe finds out.
+- **More candidate tiles.** The preset now starts with **CVT 2133 (Exp)** (request `2133`, first data byte minus 50) and **CVT 2102 (Exp)** (request `2102`, 6th data byte minus 40), then the 2103 tiles: the polynomial, N−55, **CVT cubic (Exp)** and **CVT J−55 (Exp)** (10th data byte minus 55), and raw N. Each request is sent once per cycle and shared by its tiles. The list is only swapped in automatically if your saved preset still has the old default list; if you edited it, use Profiles → restore presets. Which request your TCM supports is exactly what the probe finds out.
 - **Retry CVT** button (Live tab, next to the tiles when a CVT PID is in the profile) clears the N/S marks so the app asks again after you fix something (key on, warm engine, different timeout).
 
-**If the car does not answer.** NO DATA or a timeout on 7E1 three times in a row marks that request's tiles **N/S** and stops asking (Re-run init or **Retry CVT** resets that). Coolant and RPM keep updating from Mode 01 either way.
+**If the car does not answer.** NO DATA or a timeout on 7E1 three times in a row marks that request's tiles **N/S** and stops asking (Re-run init or **Retry CVT** resets that). Coolant and RPM keep updating from Mode 01 either way. v1.7.2 adds `2122`, Torque flow control, one no-filter retry, and a CVT estimate line — see section 21.
 
 ---
 
@@ -663,7 +664,7 @@ The first live test on the 2013 Lancer: the TCM request `2103` returned NO DATA,
 |---|---|
 | a. Timing and J1979 | `ATAT0`, `ATSTFF`, `ATH1`, `ATCRA`, `ATSH7E1`, `0100`, `0142`; then `ATSH7DF`, `0100` (look for a 7E9 line) |
 | b. Basic TCM data | `ATSH7E1`, `2107`, `2106` |
-| c. Temperature candidates | `2133`, `2102`, `2103` |
+| c. Temperature candidates | `2133`, `2102`, `2122`, `2103` |
 | d. Only if 2103 gave a first frame only or NO DATA | `ATCRA7E9`, `ATFCSH7E1`, `ATFCSD30080A`, `ATFCSM1`, `2103` (an adapter that answers `?` is tolerated), then `ATFCSM0` |
 | e. Engine sanity check | `ATSH7E0`, `ATCRA7E8`, `211A` |
 | f. Other modules | `ATCRA`, then `ATSH7E2` … `ATSH7E7`, each with `0100` |
@@ -699,4 +700,18 @@ The first live test on the 2013 Lancer: the TCM request `2103` returned NO DATA,
 - **Enhanced PIDs:** read-only Mode 21/22 framework with per-PID headers (grouped, only switched when needed, always restored to 7DF) and the experimental Mitsubishi CVT preset.
 - Unchanged: the Bluetooth connect / retry logic (10 attempts, ffea-then-fff1, writeWithoutResponse on FFF2, remembered variant).
 
-*OBD Scanner v1.7.1. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
+---
+
+## 21. What changed in v1.7.2
+
+The car test that got NO DATA used `ATSH7E1` and `ATCRA7E9`, then `2103`, with the adapter's normal short timeout and automatic flow control. v1.7.2 keeps that read-only and changes how the live preset asks:
+
+- **`2122`** (ScanGauge "CVT" X-Gauge: first data byte minus 55) is a new tile, **CVT 2122 (Exp)**, and the probe requests it. It is a short reply, so it can come back even when the long `2103` frame does not.
+- While any CVT request is in flight the app sends the Torque flow-control setup (`ATFCSH7E1`, `ATFCSD30080A`, `ATFCSM1`). When the poll finishes it sends `ATFCSM0` again, with the header back on `7DF` and the normal timeout. A clone that answers `?` is ignored.
+- If the filtered request is NO DATA (not a timeout), the app clears the receive filter and tries that same request **once** more. Three failures still mark that request N/S. **Retry CVT** clears that.
+- The Live tab shows one line, **CVT estimate**, which is whichever decoded candidate is closest to coolant (or `2122` if coolant is not in the sample). It is still experimental. The individual tiles stay so a cold-start check can throw out the wrong formula.
+- `2133` is the **first** data byte minus 50. On a one-byte reply that is also the last byte.
+
+Nothing else writes to the car. Clear codes is still the only vehicle write. The Bluetooth connect / retry logic is unchanged.
+
+*OBD Scanner v1.7.2. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*

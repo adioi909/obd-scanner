@@ -94,7 +94,7 @@
     var log = opts.log || function () {}, progress = opts.onProgress || function () {};
     var ctl = opts.control || {}, budget = opts.budgetMs || 55000, reqTimeout = opts.requestTimeout || 2600, t0 = Date.now();
     var rep = { version: opts.version || '', startedAt: new Date(t0).toISOString(), steps: [], restore: [], aborted: null, error: null, restoreOk: null, reinit: null, durationMs: 0, ranCustomFlowControl: false };
-    var cur = { tx: '7DF', rx: 'none' }, done = 0, TOTAL = 34;
+    var cur = { tx: '7DF', rx: 'none' }, done = 0, TOTAL = 35;
     function Stop(msg) { var e = new Error(msg); e.stop = true; return e; }
     function guard() {
       if (ctl.cancelled) throw Stop('cancelled by user');
@@ -144,7 +144,8 @@
       // (b) known Lancer CVT service-21 reads
       await at('ATSH7E1'); await req('2107', '(b) selector / brake bits'); await req('2106', '(b) gear number');
       // (c) temperature candidates
-      await req('2133', '(c) candidate: last byte - 50'); await req('2102', '(c) candidate: 6th data byte - 40');
+      await req('2133', '(c) candidate: first data byte - 50'); await req('2102', '(c) candidate: 6th data byte - 40');
+      await req('2122', '(c) ScanGauge CVT: first data byte - 55');
       var r2103 = await req('2103', '(c) Torque N = 14th data byte');
       // (d) custom flow control if the 2103 reply did not arrive complete
       if (r2103.result.status !== 'data') {
@@ -220,6 +221,12 @@
     }
     var d02 = lastData('2102');
     if (d02 && d02.result.data.length > 5) cands.push({ req: '2102', label: '6th data byte - 40 (letter F)', raw: hexs(d02.result.data), value: d02.result.data[5] - 40 });
+    var d22 = lastData('2122');
+    if (d22 && d22.result.data.length) {
+      var b22 = d22.result.data;
+      cands.push({ req: '2122', label: 'first byte - 55 (ScanGauge CVT)', raw: hexs(b22), value: b22[0] - 55 });
+      if (b22.length > 3) cands.push({ req: '2122', label: '4th data byte - 55 (ScanGauge TFT RXD 4008)', raw: '', value: b22[3] - 55 });
+    }
     var d03 = null;
     for (i = rep.steps.length - 1; i >= 0; i--) { s = rep.steps[i]; if (s.kind === 'req' && s.cmd === '2103' && s.tx === '7E1' && s.result.status === 'data') { d03 = s; break; } }
     if (d03) {

@@ -1,13 +1,20 @@
-# OBD Scanner (v1.7.1)
+# OBD Scanner (v1.7.2)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
 **User manual and tips:** see [MANUAL.md](MANUAL.md) in this repo, or open **Help** in the app header
-(https://adioi909.github.io/obd-scanner/manual.html). A printable PDF is built as
-`OBD-Scanner-v1.7.1-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
+(https://adioi909.github.io/obd-scanner/manual.html). The manual covers every tab, what the app can and cannot change
 on the vehicle (the only UI write is Mode 04 clear codes / reset MIL, which also resets readiness
 monitors), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+
+## v1.7.2 CVT temperature read
+The 2013 Lancer test (`ATSH7E1` / `ATCRA7E9`, then `2103`) came back NO DATA, and the sources do not agree on one formula. v1.7.2 does not guess a write and does not change the Bluetooth connect logic.
+
+- **ScanGauge `2122`** (first data byte minus 55) is polled with the other read-only candidates. The Live tab shows a **CVT estimate** — the candidate closest to coolant, labelled with which formula it used.
+- **Torque flow control** (`ATFCSH7E1`, `ATFCSD30080A`, `ATFCSM1`) is on only while a CVT request is in flight, then `ATFCSM0` is restored with the header and the normal timeout.
+- If a CVT request is NO DATA with the receive filter on, it is **retried once with the filter cleared**. A timeout is not retried.
+- The CVT probe now includes `2122`. Still services 01 and 21 only. Cache `obd-scanner-v1.7.2`.
 
 ## v1.7.1 CVT probe and CVT timeout
 - **CVT Probe** (Console tab, `js/probe.js`): read-only sequence (AT setup, services 01 and 21) that checks whether the CVT TCM (7E1/7E9) answers with a long timeout, a functional 0100, 2107/2106/2133/2102/2103, a custom flow-control retry and the other module addresses. Shows a summary with candidate temperatures and **Copy probe report** (full raw replies, also saved as a log entry). Always restores `ATSH7DF`, `ATCRA`, `ATH0`, `ATAT1`, `ATST32`, `ATFCSM0` and re-runs init. Max about 60 s, Cancel supported.

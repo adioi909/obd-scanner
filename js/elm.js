@@ -168,12 +168,14 @@
   /** Mutable record of what the app believes the adapter is configured as. */
   function createAdapterState() {
     return { dirty: false, dirtyCmds: [], header: { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }, headerKnown: true,
-      timing: { st: DEFAULT_TIMING.st, at: DEFAULT_TIMING.at }, timingKnown: true };
+      timing: { st: DEFAULT_TIMING.st, at: DEFAULT_TIMING.at }, timingKnown: true,
+      fc: { mode: 0, sh: null, sd: null }, fcKnown: true };
   }
-  /** Back to the state right after a successful init (ATZ ... ATSPx leaves the default 7DF header, no CRA filter). */
+  /** Back to the state right after a successful init (ATZ ... ATSPx leaves the default 7DF header, no CRA filter, automatic flow control). */
   function resetAdapterState(st) {
     st.dirty = false; st.dirtyCmds = []; st.header = { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }; st.headerKnown = true;
     st.timing = { st: DEFAULT_TIMING.st, at: DEFAULT_TIMING.at }; st.timingKnown = true;
+    st.fc = { mode: 0, sh: null, sd: null }; st.fcKnown = true;
     return st;
   }
 

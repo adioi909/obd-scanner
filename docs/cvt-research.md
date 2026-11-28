@@ -1,7 +1,9 @@
 # CVT fluid temp on a 2013 Lancer (JF011E/F1CJA) with a generic ELM327 - research notes (2026-11-27)
 
+Implemented in the app as v1.7.2 (read-only): live polling uses ATAT0 + ATSTFF, Torque flow control (ATFCSH7E1 / ATFCSD30080A / ATFCSM1, restored with ATFCSM0), a single retry with the receive filter cleared after NO DATA, and ScanGauge 2122 (first data byte minus 55) next to 2133 / 2102 / 2103. The Live "CVT estimate" line ranks decoded candidates against coolant. It does not lock a formula; cold versus warm on the car still decides that. Bluetooth connect logic was not changed.
+
 Context: ATSH7E1 / ATCRA7E9 accepted, then 2103 and 2101 -> NO DATA. Functional 0100 (ATH1, 7DF) shows only 7E8.
-Research only. No code/deploy changes. Nothing below has been verified on Robert's car.
+The notes below are the research that v1.7.2 was built from. Nothing in them has been verified on this car yet.
 
 ## What the sources say
 

@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.7.1';
+  var APP_VERSION = 'v1.7.2';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -321,12 +321,25 @@
     }).join('');
     tileStats = {};
     var rb = $('#btn-retry-cvt'); if (rb) rb.classList.toggle('hidden', !p.pids.some(function (x) { return PIDS.isEnhanced(x); }));
+    liveValues = {};
+    updateCvtNote();
   }
   function markTileNS(pid) {
     var el = document.getElementById('tile-' + pid); if (!el || el.dataset.ns) return;
     el.dataset.ns = '1'; el.style.opacity = '.5';
     var l = el.querySelector('.lbl'); if (l && l.textContent.indexOf('(n/s)') < 0) l.textContent += ' (n/s)';
     el.querySelector('.val').textContent = 'N/S';
+  }
+  var liveValues = {};
+  function updateCvtNote() {
+    var note = $('#cvt-note'); if (!note) return;
+    var prof = activeProfile();
+    var show = prof && prof.pids.some(function (x) { return PIDS.isEnhanced(x); });
+    var pick = show ? PIDS.pickCvt(liveValues) : null;
+    if (!pick) { note.classList.add('hidden'); note.textContent = ''; return; }
+    var disp = PIDS.toDisplay(pick.pid, pick.value, settings.units);
+    note.classList.remove('hidden');
+    note.textContent = 'CVT estimate ' + PIDS.format(disp.value, disp.unit) + ' ' + disp.unit + ' from ' + pick.label + '. Experimental — on a cold car this should sit near coolant. The other tiles are the raw candidates.';
   }
   function updateTiles(values) {
     Object.keys(values).forEach(function (pid) {
@@ -339,7 +352,9 @@
       el.querySelector('.mx').textContent = 'max ' + PIDS.format(st.max, disp.unit);
       var pct = Math.max(0, Math.min(100, (disp.value - disp.min) / (disp.max - disp.min) * 100));
       el.querySelector('.bar i').style.width = (isNaN(pct) ? 0 : pct) + '%';
+      liveValues[pid] = values[pid];
     });
+    updateCvtNote();
   }
 
   $('#btn-retry-cvt').onclick = function () {

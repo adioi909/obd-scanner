@@ -798,6 +798,8 @@
       if (mode !== '21') return 'NO DATA';
       if (tx === '7E1') {
         if (!this.tcm || !this._tcmTiming()) return 'NO DATA';
+        // Test hook only: a clone whose ATCRA filter drops the TCM reply. Not used by the BLE dongle path.
+        if (this.opts.tcmNeedsOpenFilter && this.rxFilter) return 'NO DATA';
         if (this.tcm === 'hang' && rest === '03') return null;
         var d = this._tcmService(rest);
         if (!d) return this.opts.tcmNrc ? this._deliver([{ id: '7E9', hex: '7F2112' }]) : 'NO DATA';
@@ -845,6 +847,7 @@
     if (rest === '07') return [0x10, 0x00, 0x00, 0x00, 0x00];
     if (rest === '06') return [0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
     if (rest === '33') return [o.t33 != null ? o.t33 : 95];
+    if (rest === '22') return [o.t22 != null ? o.t22 : 90, 0x00, 0x10, o.t22b != null ? o.t22b : 100];
     if (rest === '02') return [0x20, 0x30, 0x40, 0x50, 0x60, o.t02 != null ? o.t02 : 65, 0x70, 0x80];
     return null;
   };
