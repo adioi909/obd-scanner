@@ -29,7 +29,7 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   await page.goto(url, { waitUntil: 'networkidle0' });
   check(await page.$('#btn-connect') !== null, 'page loads');
   const ver = await page.$eval('#app-ver', e => e.textContent);
-  check(ver === 'v1.7.0', 'visible version is v1.7.0, got ' + ver);
+  check(ver === 'v1.7.1', 'visible version is v1.7.1, got ' + ver);
   await page.screenshot({ path: path.join(shots, '1-connect.png') });
 
   await page.click('#btn-mock');
@@ -238,6 +238,28 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
   check(!isNaN(parseFloat(rpm2)), 'live re-synced the adapter and RPM updates: ' + rpm2);
   await page.click('#btn-live');
   await page.screenshot({ path: path.join(shots, '7-console.png') });
+
+  // v1.7.1: CVT probe in Demo mode
+  await page.click('.tabs [data-view=console]');
+  check(await page.$eval('#btn-probe', b => !b.disabled), 'CVT probe button present');
+  await page.$eval('#btn-probe', b => b.click());
+  await page.waitForFunction(() => !document.querySelector('#probe-summary').classList.contains('hidden'), { timeout: 40000 });
+  const ps = await page.$eval('#probe-summary', e => e.textContent);
+  check(/7E9 \(CVT TCM\) answered: YES/.test(ps) && /2133/.test(ps) && /Candidate temperatures/.test(ps), 'probe summary shows TCM + candidates');
+  check(await page.$eval('#btn-probe-copy', b => !b.classList.contains('hidden')), 'Copy probe report button shown');
+  const pst = await page.evaluate(() => ({ h: window.__app.state.transport.txHeader, cra: window.__app.state.transport.rxFilter, hd: window.__app.state.transport.headers, st: window.__app.state.transport.st, at: window.__app.state.transport.at, fc: window.__app.state.transport.fcMode, dirty: window.__app.state.obd.adapter.dirty, banner: document.querySelector('#dirty-banner').classList.contains('hidden'), saved: !!window.__app.state.lastProbe }));
+  check(pst.h === '7DF' && pst.cra === null && pst.hd === false && pst.st === '32' && pst.at === 1 && pst.fc === 0 && !pst.dirty && pst.banner && pst.saved, 'adapter restored after probe: ' + JSON.stringify(pst));
+  await page.waitForFunction(() => document.querySelector('#console').textContent.includes('CVT PROBE REPORT'), { timeout: 5000 }).catch(() => {});
+  check(await page.evaluate(() => window.__app.state.lastProbe.startsWith('=== OBD Scanner CVT probe report') && document.querySelector('#console').textContent.includes('CVT PROBE REPORT')), 'probe report saved as a Console log entry');
+  await page.$eval('#btn-probe-copy', b => b.click());
+  await wait(300);
+  // Retry CVT button on the Live tab with the CVT preset
+  await page.click('.tabs [data-view=live]');
+  await page.select('#live-profile', 'preset-mitsu-cvt');
+  check(await page.$eval('#btn-retry-cvt', b => !b.classList.contains('hidden')), 'Retry CVT button visible for a CVT profile');
+  await page.select('#live-profile', 'preset-quick');
+  check(await page.$eval('#btn-retry-cvt', b => b.classList.contains('hidden')), 'Retry CVT hidden for a standard profile');
+  check(await page.$eval('#s-cvtst', i => i.value) === 'FF', 'CVT timeout setting defaults to FF');
 
   check(errors.length === 0, 'no page errors' + (errors.length ? ': ' + errors.join(' | ') : ''));
   await browser.close(); if (server) server.close();

@@ -58,7 +58,8 @@ test('v1.7: after a manual ATH1 + ATS1 the parser breaks; resync() restores ATH0
   ['ATH1', 'ATS1', 'ATSH7E1'].forEach(c => ELM.markDirty(obd.adapter, c));
   // Header no longer known after a manual ATSH: the next mode-01 poll restores 7DF first instead of asking the TCM.
   const before = await obd.queryPids(['0C']);
-  assert.equal(typeof before['0C'], 'number');
+  // v1.7.1: the simulated adapter now really prints headers after ATH1, so the headerless parser may not decode this.
+  assert.ok(before['0C'] == null || typeof before['0C'] === 'number');
   assert.ok(tx(logs, /^ATSH7DF$/).length >= 1, 'header restored before polling');
   assert.equal(obd.adapter.dirty, true, 'still dirty until echo/spaces/headers are re-synced');
   assert.equal(await obd.resync(), true);
@@ -166,7 +167,7 @@ test('v1.7: new presets are added once to existing profile lists; a deleted pres
 // ---------------- 5. enhanced PIDs + header switching ----------------
 test('v1.7: CVT preset is read-only, labelled (Exp), targets 7E1/7E9 with request 2103 and decodes byte N', () => {
   const pre = PIDS.PRESETS.find(p => p.id === 'preset-mitsu-cvt');
-  assert.deepEqual(pre.pids, ['MCVT', 'MCVT8', 'MCVTN', '05', '0C']);
+  assert.deepEqual(pre.pids, ['MCVT33', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C']); // v1.7.1 adds candidate PIDs
   for (const id of ['MCVT', 'MCVT8', 'MCVTN']) {
     const d = PIDS.get(id);
     assert.ok(/\(Exp/.test(d.short) && /\(Exp/.test(d.name), id);
@@ -305,9 +306,9 @@ test('v1.7: clearQueue also releases the in-flight wait, so the session is usabl
 });
 
 // ---------------- 1. service worker + versions ----------------
-test('v1.7: service worker precaches only the app shell (no MANUAL.md / PDF / brief) and uses cache obd-scanner-v1.7.0', () => {
+test('v1.7: service worker precaches only the app shell (no MANUAL.md / PDF / brief) and uses a versioned cache (obd-scanner-v1.7.x)', () => {
   const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  assert.match(sw, /var CACHE = 'obd-scanner-v1\.7\.0';/);
+  assert.match(sw, /var CACHE = 'obd-scanner-v1\.7\.\d';/);
   const assets = JSON.parse(sw.match(/var ASSETS = (\[[^\]]*\])/)[1].replace(/'/g, '"'));
   assert.ok(assets.includes('manual.html') && assets.includes('js/app.js') && assets.includes('index.html'));
   for (const a of assets) assert.ok(!/\.md$|\.pdf$|GROK_BUILD_BRIEF|\.zip$/i.test(a), 'not precached: ' + a);
@@ -316,12 +317,12 @@ test('v1.7: service worker precaches only the app shell (no MANUAL.md / PDF / br
   assert.ok(!re.test('/obd-scanner/js/app.js'));
 });
 
-test('v1.7: version string is v1.7.0 everywhere', () => {
+test('v1.7: version string is v1.7.x everywhere (bumped to 1.7.1 in v1.7.1, see v171.test.js)', () => {
   const read = f => fs.readFileSync(path.join(root, f), 'utf8');
-  assert.match(read('index.html'), /<title>OBD Scanner v1\.7\.0<\/title>/);
-  assert.match(read('index.html'), /id="app-ver">v1\.7\.0</);
-  assert.match(read('js/app.js'), /APP_VERSION = 'v1\.7\.0'/);
-  assert.equal(JSON.parse(read('package.json')).version, '1.7.0');
-  assert.match(read('MANUAL.md'), /Version 1\.7\.0/);
-  assert.match(read('README.md'), /v1\.7\.0/);
+  assert.match(read('index.html'), /<title>OBD Scanner v1\.7\.\d<\/title>/);
+  assert.match(read('index.html'), /id="app-ver">v1\.7\.\d</);
+  assert.match(read('js/app.js'), /APP_VERSION = 'v1\.7\.\d'/);
+  assert.match(JSON.parse(read('package.json')).version, /^1\.7\.\d$/);
+  assert.match(read('MANUAL.md'), /Version 1\.7\.\d/);
+  assert.match(read('README.md'), /v1\.7\.\d/);
 });
