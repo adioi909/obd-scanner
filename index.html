@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d1117">
-<title>OBD Scanner v1.7.2</title>
+<title>OBD Scanner v1.7.3</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon.svg">
@@ -12,7 +12,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.7.2</small> <a class="help-link" href="manual.html" target="_blank" rel="noopener">Help</a></div>
+  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.7.3</small> <a class="help-link" href="manual.html" target="_blank" rel="noopener">Help</a></div>
   <div id="status" class="pill off" role="status">Disconnected</div>
 </header>
 <div id="dirty-banner" class="banner hidden" role="alert">
@@ -135,6 +135,37 @@
     <div id="profile-editor" class="card hidden"></div>
   </section>
 
+  <!-- LAB -->
+  <section id="view-lab" class="view">
+    <div class="card">
+      <h2>Lab</h2>
+      <p class="hint">The CVT probe on this car already settled the temperature request: the engine (7E8) answers, including service 21 <span class="mono">211A</span>, and the transmission address 7E1 never answers <span class="mono">0100</span> or any of <span class="mono">2102</span> / <span class="mono">2103</span> / <span class="mono">2122</span> / <span class="mono">2133</span>. Headers were on and the receive filter was off, so this was not a hidden 7E9 frame.</p>
+      <p class="hint">These reads check the one thing the probe could not: whether this clone actually applies <span class="mono">ATCRA</span>, or only ever passes 7E8. The engine sweep is raw service 21. It is not a fluid-temperature formula.</p>
+    </div>
+    <div class="card tight">
+      <h2>Reads</h2>
+      <div class="btn-col">
+        <button id="btn-lab-filter" class="btn primary big">Test receive filter</button>
+        <button id="btn-lab-engine" class="btn big">Engine service 21</button>
+        <button id="btn-lab-m8" class="btn big">List on-board tests (Mode 08)</button>
+      </div>
+      <div class="chips" id="lab-m8-tests"></div>
+      <p class="hint">Mode 08 TID 00 only asks which tests exist. A <b>Run</b> button sends that test. That can start an EVAP test. It asks first. It cannot be undone. Key on, engine off.</p>
+    </div>
+    <div class="card tight">
+      <h2>Dongle revert</h2>
+      <p class="hint">A generic ELM clone cannot read back Mitsubishi coding, adaptations, or the immobilizer, so there is nothing to restore those from. Clear codes (Codes tab) is permanent. Mode 10 / 11 / 27 / 2E stay in the Console behind the confirm dialog on purpose: a wrong one can brick a module, and this app cannot undo it.</p>
+      <p class="hint">What revert does do: put the <b>dongle</b> back to the snapshot taken before the last Lab action (header, receive filter, timeout, flow control), with headers off so Live can parse again. Full re-init is an <span class="mono">ATZ</span>.</p>
+      <div class="btn-col">
+        <button id="btn-lab-snap" class="btn big">Snapshot dongle now</button>
+        <button id="lab-revert" class="btn big" disabled>Revert dongle to snapshot</button>
+        <button id="btn-lab-init" class="btn big ghost">Full re-init</button>
+      </div>
+    </div>
+    <pre id="lab-out" class="probe-summary hidden"></pre>
+    <button id="btn-lab-copy" class="btn full">Copy lab result</button>
+  </section>
+
   <!-- CONSOLE -->
   <section id="view-console" class="view">
     <div class="card tight" id="probe-card">
@@ -171,6 +202,7 @@
   <button data-view="logs"><span class="ic">≋</span>Logs</button>
   <button data-view="profiles"><span class="ic">☰</span>Profiles</button>
   <button data-view="console"><span class="ic">›_</span>Console</button>
+  <button data-view="lab"><span class="ic">⚑</span>Lab</button>
 </nav>
 
 <dialog id="dlg">
@@ -190,6 +222,7 @@
 <script src="js/dtc.js"></script>
 <script src="js/transport.js"></script>
 <script src="js/probe.js"></script>
+<script src="js/lab.js"></script>
 <script src="js/obd.js"></script>
 <script src="js/storage.js"></script>
 <script src="js/chart.js"></script>

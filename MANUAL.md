@@ -1,6 +1,6 @@
 # OBD Scanner User Manual
 
-**Version 1.7.2**  
+**Version 1.7.3**  
 Field OBD-II scanner for Chrome on Android and a Bluetooth LE ELM327-style dongle.
 
 Live app: https://adioi909.github.io/obd-scanner/  
@@ -34,12 +34,13 @@ This manual describes what the app actually does. It does not invent features. N
 19. [What changed in v1.7.1](#19-what-changed-in-v1-7-1)
 20. [What changed in v1.7.0](#20-what-changed-in-v1-7-0)
 21. [What changed in v1.7.2](#21-what-changed-in-v1-7-2)
+22. [What changed in v1.7.3](#22-what-changed-in-v1-7-3)
 
 ---
 
 ## 1. What this app is
 
-OBD Scanner is a Torque / Car Scanner-style tool that runs in the browser. It talks to a generic Bluetooth LE ELM327-style adapter over **Web Bluetooth**, reads live sensor data (Mode 01), diagnostic trouble codes (Modes 03 / 07 / 0A), freeze frame (Mode 02), and VIN (Mode 09, PID 02). The only vehicle **write** action in the user interface is **Clear codes / reset MIL** (Mode 04).
+OBD Scanner is a Torque / Car Scanner-style tool that runs in the browser. It talks to a generic Bluetooth LE ELM327-style adapter over **Web Bluetooth**, reads live sensor data (Mode 01), diagnostic trouble codes (Modes 03 / 07 / 0A), freeze frame (Mode 02), and VIN (Mode 09, PID 02). The vehicle writes in the user interface are **Clear codes / reset MIL** (Mode 04) and, on the Lab tab, a **Mode 08 on-board test** after you confirm it. Neither has an undo.
 
 It is plain HTML, CSS and JavaScript with no build step. It is a PWA, so you can add it to the Android home screen and it still works offline after it has been cached (network-first: it tries for a fresh copy when you are online).
 
@@ -356,9 +357,9 @@ The interlock asks before write-capable commands, but once you confirm, the Cons
 
 ## 11. Capabilities and limits: what can it change on the vehicle?
 
-Short answer: **with this app, a generic ELM327 clone, and standard OBD-II, the only button that changes the vehicle is Clear codes / reset MIL (Mode 04).** That also resets readiness monitors. Every other button, tab and preset is read-only, including the experimental Mitsubishi CVT preset (a Mode 21 read).
+Short answer: **Clear codes (Mode 04) changes the car, and a Lab "Run" button for a Mode 08 test can start an on-board test such as EVAP.** Neither can be undone. Every other button is a read, or it only changes the dongle (header, filter, timeout), which **Revert dongle** puts back. The experimental CVT preset is a Mode 21 read.
 
-The one honest exception is the **raw Console**: it can send any command you type. Since v1.7.0, write-capable commands (Mode 04 and UDS 10, 11, 27, 2E, 2F, 31, 34, 36, 37) only go out after an explicit confirmation, with Cancel as the default. So writes other than the Clear codes button are possible **only** by typing them into the raw Console and confirming. The app does not build those commands for you, has no undo, and does not know whether a module will accept them (most need security access the app does not have).
+The **raw Console** can send any command you type. Since v1.7.0, write-capable commands (Mode 04, Mode 08 except the 0800 test list, and UDS 10, 11, 27, 2E, 2F, 31, 34, 36, 37) only go out after an explicit confirmation, with Cancel as the default. The app does not know whether a module will accept them (coding writes usually need security access this app does not have), and it cannot read the old value back to restore it.
 
 ### What the app can do today
 
@@ -373,8 +374,10 @@ The one honest exception is the **raw Console**: it can send any command you typ
 | Adapter ID, voltage, protocol | ATI, ATRV, ATDPN | Vehicle card and Console | No |
 | Mitsubishi CVT fluid temperature (Experimental) | Mode 21, request 2103 on header 7E1 (reply filter 7E9) | Mitsubishi CVT (Experimental) preset | No (read). Header is restored to 7DF afterwards |
 | Record a drive and export CSV | — | Live / Logs | No |
-| **Clear codes / reset MIL** | **Mode 04** | **Clear codes button, and Console if you send 04 and confirm** | **Yes — erases codes and freeze frame, resets readiness** |
-| Raw UDS / manufacturer commands | Anything typed in Console; 10/11/27/2E/2F/31/34/36/37 need confirmation | Console only | Possibly. Depends on the command and the module; usually rejected without security access |
+| **Clear codes / reset MIL** | **Mode 04** | **Clear codes button, and Console if you send 04 and confirm** | **Yes — erases codes and freeze frame, resets readiness. No undo.** |
+| On-board test list | Mode 08 TID 00 (`0800`) | Lab tab | No (read) |
+| **Run an on-board test** | **Mode 08 TID 01 and up** | **Lab, after confirm. Often EVAP.** | **Yes — can start a test. No undo. Key on, engine off.** |
+| Raw UDS / manufacturer commands | Anything typed in Console; 10/11/27/2E/2F/31/34/36/37 need confirmation | Console only | Possibly. Depends on the command and the module; usually rejected without security access. No undo. |
 
 Mode 09 in this app is **VIN only** (0902). Calibration ID, CVN, and other Mode 09 PIDs are not requested automatically. You can type them in Console (for example 0904) and you will see the raw reply; the app will not decode them.
 
@@ -712,6 +715,17 @@ The car test that got NO DATA used `ATSH7E1` and `ATCRA7E9`, then `2103`, with t
 - The Live tab shows one line, **CVT estimate**, which is whichever decoded candidate is closest to coolant (or `2122` if coolant is not in the sample). It is still experimental. The individual tiles stay so a cold-start check can throw out the wrong formula.
 - `2133` is the **first** data byte minus 50. On a one-byte reply that is also the last byte.
 
-Nothing else writes to the car. Clear codes is still the only vehicle write. The Bluetooth connect / retry logic is unchanged.
+Nothing else writes to the car. Clear codes is still the only vehicle write on the Codes tab. The Bluetooth connect / retry logic is unchanged.
 
-*OBD Scanner v1.7.2. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
+---
+
+## 22. What changed in v1.7.3
+
+The CVT probe on this 2013 Lancer, engine around 170 °F, is decisive. With headers on and no receive filter, only 7E8 answered. Physical `0100` to 7E1 was NO DATA, and so were `2107`, `2106`, `2133`, `2102`, `2122` and `2103`, including the flow-control retry. `7E0 211A` came back in under 200 ms, so the dongle can talk to a module that is actually there. 7E2 through 7E7 were silent. There is no CVT temperature to show until some other address answers.
+
+- **Lab tab.** Receive-filter test: does this clone honor `ATCRA`, or does it only pass 7E8? Engine service 21 sweep, raw hex, no invented temperature. Mode 08 TID 00 lists on-board tests. Running one asks first. Key on, engine off.
+- **Revert dongle** restores the snapshot taken before the last Lab action (header, filter, timeout, flow control). **Full re-init** sends `ATZ`. Neither one undeletes codes or undoes a test that already ran. Mode 10, 11, 27 and 2E stay in the Console, behind confirm, because this clone cannot read the old value back.
+- Live CVT requests now wait about 3.2 s, past this clone's 2.1–2.8 s NO DATA. If a command still times out, the late prompt is drained before the next command.
+
+*OBD Scanner v1.7.3. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
+

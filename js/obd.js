@@ -420,7 +420,9 @@
       await this.setTiming(wantT);
       var wantFc = g.reqOrder.some(function (rq0) { return g.reqs[rq0].some(function (p0) { return PIDS.get(p0).flowControl; }); });
       if (wantFc) await this.setFlowControl({ mode: 1, sh: g.header.tx, sd: '30080A' });
-      var reqTimeout = Math.max(this._pidTimeout(), 1500, slow ? parseInt(this.enhancedSt, 16) * 4 + 1200 : 0);
+      // This clone's NO DATA on 7E1 arrives at about 2.1–2.8 s even after ATSTFF (datasheet FF is ~1 s).
+      // The app has to outlast that, or the late prompt is read as the next command's answer.
+      var reqTimeout = Math.max(this._pidTimeout(), 1500, slow ? parseInt(this.enhancedSt, 16) * 4 + 2200 : 0);
       // Failure counts stay on the header we started with, even if a retry clears the receive filter.
       var failHeader = { tx: g.header.tx, rx: g.header.rx };
       for (var ri = 0; ri < g.reqOrder.length; ri++) {

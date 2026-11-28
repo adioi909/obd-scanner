@@ -1,12 +1,18 @@
-# OBD Scanner (v1.7.2)
+# OBD Scanner (v1.7.3)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
 **User manual and tips:** see [MANUAL.md](MANUAL.md) in this repo, or open **Help** in the app header
 (https://adioi909.github.io/obd-scanner/manual.html). The manual covers every tab, what the app can and cannot change
-on the vehicle (the only UI write is Mode 04 clear codes / reset MIL, which also resets readiness
-monitors), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+on the vehicle (Clear codes is Mode 04; a Lab Mode 08 test can also start an on-board test after you confirm it; neither has an undo), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+
+## v1.7.3 Lab, after the CVT probe
+The probe on the car (headers on, no receive filter) showed only 7E8. 7E1 answered neither `0100` nor any service 21 temperature request. `7E0 211A` did answer, so physical addressing works. v1.7.3 does not invent a CVT temperature.
+
+- **Lab tab:** receive-filter test (`ATCRA7E8` must show the engine, `ATCRA7E0` must hide it, `ATCRA7E9` looks for the TCM), a raw engine service-21 sweep, and Mode 08 TID 00. Running a Mode 08 test asks first.
+- **Revert dongle** restores the pre-action snapshot. It does not undo clear-codes, a finished on-board test, or a Console Mode 10/11/2E. Those last ones stay behind the existing confirm because they are not reversible from this clone.
+- Live CVT waits ~3.2 s so this clone's late `NO DATA` (about 2.1–2.8 s) is not paired with the next command. Cache `obd-scanner-v1.7.3`.
 
 ## v1.7.2 CVT temperature read
 The 2013 Lancer test (`ATSH7E1` / `ATCRA7E9`, then `2103`) came back NO DATA, and the sources do not agree on one formula. v1.7.2 does not guess a write and does not change the Bluetooth connect logic.

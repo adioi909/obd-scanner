@@ -209,6 +209,13 @@
     if (out.isAt) { out.atMutating = AT_MUTATING.test(c); return out; }
     if (/^[0-9A-F]{2}/.test(c)) {
       var sv = c.slice(0, 2);
+      if (sv === '08') {
+        out.service = '08';
+        var tid = c.slice(2, 4);
+        // 0800 only asks which tests exist. 0801 and up can start one (EVAP and similar).
+        if (tid && tid !== '00') { out.write = true; out.reason = 'Mode 08 test ' + tid + ' (can start an on-board test such as EVAP)'; }
+        return out;
+      }
       if (WRITE_SERVICES[sv]) { out.write = true; out.service = sv; out.reason = WRITE_SERVICES[sv]; }
     }
     return out;

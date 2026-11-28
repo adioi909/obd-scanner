@@ -809,6 +809,11 @@
       return 'NO DATA';
     }
     if (tx === '7DF' || tx === '7E0') {
+      if (mode === '08') {
+        // TID 00 = supported on-board tests (bit 7 = TID 01). Any other TID echoes a short result. Test hook only.
+        if (rest === '00') return this._deliver([{ id: '7E8', hex: '480080000000' }]);
+        return this._deliver([{ id: '7E8', hex: '48' + rest + '0000' }]);
+      }
       var e = this._engineHex(mode, rest, body);
       if (e === null) return null; // simulated hang
       if (e) list.push({ id: '7E8', hex: e });
@@ -894,7 +899,7 @@
   MockTransport.prototype._deliver = function (list) {
     var self = this, out = [];
     list.forEach(function (r) {
-      if (self.rxFilter && self.rxFilter !== r.id) return; // ATCRA filter
+      if (self.rxFilter && !self.opts.craIgnored && self.rxFilter !== r.id) return; // ATCRA filter (craIgnored = clone that accepts ATCRA and ignores it)
       out.push(self.headers ? self._framesH1(r.id, r.hex) : self._fmtH0(r.hex));
     });
     return out.length ? out.join('\r') : 'NO DATA';
@@ -927,6 +932,7 @@
     this.log = this.opts.log || function () {};
     this.buffer = ''; this.pending = null; this.queue = []; this.busy = false;
     this.gotRx = false; this.dead = false; this.deadError = null;
+    this.drainLateMs = (this.opts.drainLateMs > 0) ? this.opts.drainLateMs : 0;
     var self = this;
     transport.onData = function (s) { self._onData(s); };
   }
@@ -976,12 +982,34 @@
     this.clearQueue(e);
   };
 
+  /** Wait out a prompt that shows up after we already timed out, so it is not paired with the next command. */
+  ElmSession.prototype._drainLate = function (ms) {
+    var self = this;
+    return new Promise(function (resolve) {
+      self.pending = {
+        resolve: function () { resolve(true); },
+        abort: function () { resolve(false); },
+        timer: setTimeout(function () { if (self.pending) { self.pending = null; resolve(false); } }, ms)
+      };
+      self._check();
+    }).then(function (got) { self.buffer = ''; return got; });
+  };
+
   ElmSession.prototype._pump = async function () {
     if (this.busy || !this.queue.length) return;
     this.busy = true;
     var job = this.queue.shift();
     if (this.dead) { this.busy = false; job.reject(this.deadError); return this._pump(); }
-    if (this.afterTimeout) { this.afterTimeout = false; await sleep(150); }
+    // v1.7.3: this clone prints NO DATA about 2.1–2.8 s after a 7E1 request. If the app
+    // gives up first, that late prompt used to be read as the answer to the NEXT command
+    // (2103 looked like instant NO DATA, then ATSH7DF timed out). Wait it out, then drop it.
+    if (this.afterTimeout) {
+      this.afterTimeout = false;
+      if (this.drainLateMs > 0) {
+        var drained = await this._drainLate(this.drainLateMs);
+        this.log('info', drained ? 'Drained a late adapter reply before the next command' : 'No late reply after timeout; continuing');
+      } else await sleep(150);
+    }
     this.buffer = '';
     var label = job.cmd === '' ? '(bare CR)' : job.cmd;
     var started = Date.now();
