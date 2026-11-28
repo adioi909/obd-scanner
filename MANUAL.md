@@ -1,6 +1,6 @@
 # OBD Scanner User Manual
 
-**Version 1.7.0**  
+**Version 1.7.1**  
 Field OBD-II scanner for Chrome on Android and a Bluetooth LE ELM327-style dongle.
 
 Live app: https://adioi909.github.io/obd-scanner/  
@@ -30,7 +30,9 @@ This manual describes what the app actually does. It does not invent features. N
 15. [Updating the app](#15-updating-the-app)
 16. [Built-in PID library](#16-built-in-pid-library)
 17. [Mitsubishi CVT (Experimental)](#17-mitsubishi-cvt-experimental)
-18. [What changed in v1.7.0](#18-what-changed-in-v1-7-0)
+18. [CVT Probe (v1.7.1)](#18-cvt-probe-v1-7-1)
+19. [What changed in v1.7.1](#19-what-changed-in-v1-7-1)
+20. [What changed in v1.7.0](#20-what-changed-in-v1-7-0)
 
 ---
 
@@ -131,6 +133,7 @@ Defaults are listed. Changes are saved on the phone (localStorage).
 | Fast response (append "1") | On | Appends `1` to live requests so the adapter can return after one response. Turn off if replies look truncated or empty. |
 | BLE write mode | Auto | Auto prefers writeWithoutResponse (correct for this dongle). "Without response" / "With response" lock the mode. **Applies on the next connect.** |
 | BLE notify characteristic | Auto | Auto runs the persistent-retry variants (including ffea-then-fff1, which is the working recipe on this dongle). "fff1 only" / "ffea only" lock the notify characteristic. **Applies on the next connect.** |
+| CVT timeout (hex, ATST) | FF | v1.7.1. How long the adapter waits for the transmission module (7E1) to answer, in 4 ms units: FF is about 1 second, 64 about 400 ms. Only used while the CVT preset talks to 7E1, then the normal 200 ms timing is restored. Values outside 20 to FF fall back to FF. |
 | Command timeout (ms) | 2500 | How long the app waits for an ELM prompt before a command is considered failed. Range 500–10000. |
 
 Pull-to-refresh is disabled in the app so a downward swipe cannot reload the page and drop the Bluetooth session.
@@ -298,6 +301,8 @@ The Console is a raw terminal to the ELM327.
 - **Clear** clears the on-screen log (it does not reset the adapter).
 
 The on-screen view shows recent lines; the copied log can include more (the app keeps a larger ring buffer).
+
+**CVT Probe card (v1.7.1).** Below the log is a **Run CVT probe** button with a progress line, a summary and **Copy probe report**. It is a read-only diagnostic for the transmission module; section 18 explains it.
 
 ### Write interlock (v1.7.0)
 
@@ -630,11 +635,62 @@ The sources disagree because Lancer X cars shipped with different CVT generation
 `EXP 7E1/7E9 2103 raw (20 data bytes): 10 11 ... | data[13] (Torque N) = 0x64 = 100 -> CVT temp (Exp)=47.5, CVT N-55 (Exp)=45, CVT raw N (Exp)=100`.
 Copy that log if neither formula matches.
 
-**If the car does not answer.** NO DATA or a timeout on 7E1 three times in a row marks the CVT tiles **N/S** and stops asking (Re-run init resets that). Coolant and RPM keep updating from Mode 01 either way.
+**v1.7.1 changes to the CVT preset.**
+
+- **Longer timeout on 7E1.** The first live test got NO DATA from the TCM although it is known to answer slowly. While the app is on the 7E1 header it now sends `ATAT0` (adaptive timing off) and `ATSTFF` (about 1 second, set under Settings, CVT timeout) and waits up to about 2.5 seconds for the reply. When it is done, success or not, it sends `ATAT1` and `ATST32` so ordinary polling is as fast as before. The Console banner and Re-run init also restore those.
+- **More candidate tiles.** The preset now starts with **CVT 2133 (Exp)** (request `2133`, last byte minus 50) and **CVT 2102 (Exp)** (request `2102`, 6th data byte minus 40), then the 2103 tiles: the polynomial, N−55, **CVT cubic (Exp)** and **CVT J−55 (Exp)** (10th data byte minus 55), and raw N. Each request is sent once per cycle and shared by its tiles. The list is only swapped in automatically if your saved preset still has the old default list; if you edited it, use Profiles → restore presets. Which request your TCM supports is exactly what the probe finds out.
+- **Retry CVT** button (Live tab, next to the tiles when a CVT PID is in the profile) clears the N/S marks so the app asks again after you fix something (key on, warm engine, different timeout).
+
+**If the car does not answer.** NO DATA or a timeout on 7E1 three times in a row marks that request's tiles **N/S** and stops asking (Re-run init or **Retry CVT** resets that). Coolant and RPM keep updating from Mode 01 either way.
 
 ---
 
-## 18. What changed in v1.7.0
+## 18. CVT Probe (v1.7.1)
+
+The first live test on the 2013 Lancer: the TCM request `2103` returned NO DATA, and a functional `0100` showed only one responder (7E8, the engine). The probe tries, in order, the things that usually explain that: a longer timeout, a functional request that a slow TCM might answer, the other service-21 requests that Mitsubishi TCMs use, a custom flow-control retry for multi-frame replies, and the other module addresses. It sends nothing that writes to the car.
+
+**How to run it**
+
+1. Connect, key on (engine running if you can, and note whether the car is cold or warm).
+2. Console tab → **Run CVT probe**. It needs a connection. If Live is on it stops Live first; while a recording is running it refuses (stop the recording first).
+3. Watch the progress line. It takes about 15 to 40 seconds and never more than about a minute. **Cancel** stops it at the next step.
+4. Read the summary: which addresses answered (7E8 engine, 7E9 TCM, others), which requests returned data, and the decoded candidate temperatures. A hint line says what the result suggests.
+5. Tap **Copy probe report** and paste it into a message or chat. It contains the app version, time, adapter, VIN, the summary and every raw reply. The same text is saved as one entry in the Console log (and can be copied from there with Copy log).
+
+**What it sends** (read-only: AT setup, service 01, service 21):
+
+| Step | Commands |
+|---|---|
+| a. Timing and J1979 | `ATAT0`, `ATSTFF`, `ATH1`, `ATCRA`, `ATSH7E1`, `0100`, `0142`; then `ATSH7DF`, `0100` (look for a 7E9 line) |
+| b. Basic TCM data | `ATSH7E1`, `2107`, `2106` |
+| c. Temperature candidates | `2133`, `2102`, `2103` |
+| d. Only if 2103 gave a first frame only or NO DATA | `ATCRA7E9`, `ATFCSH7E1`, `ATFCSD30080A`, `ATFCSM1`, `2103` (an adapter that answers `?` is tolerated), then `ATFCSM0` |
+| e. Engine sanity check | `ATSH7E0`, `ATCRA7E8`, `211A` |
+| f. Other modules | `ATCRA`, then `ATSH7E2` … `ATSH7E7`, each with `0100` |
+
+**Restore.** Whatever happens (success, timeout, an error halfway, Cancel, the time limit) the probe always sends `ATSH7DF`, `ATCRA`, `ATH0`, `ATAT1`, `ATST32`, `ATFCSM0`, then re-runs the normal init and clears the adapter-state banner. If the Bluetooth link itself dropped, it cannot restore; the banner stays on and Connect again.
+
+**Reading the result**
+
+- *7E9 answered a functional 0100*: the TCM is there and was only too slow; the longer timeout in the CVT preset should now work.
+- *7E9 answered service 21 with data*: compare the candidate temperatures with air and coolant temperature. On a cold car (key on a few minutes) the right one is close to ambient; warm, it rises more slowly than coolant. The formulas disagree between sources, so cold and warm readings of all candidates are what settle it.
+- *Negative response (7F 21 nn)*: the TCM understood but refused that request or local identifier (12 = not supported, 22 = conditions not correct).
+- *Only 7E8 answers*: the TCM did not talk even with a 1 second timeout. Try engine running, then send the report.
+
+**Sending the report.** Paste it into a chat, together with the research notes shipped in the Grok Build zip (`docs/cvt-research.md`), and ask for the next steps.
+
+---
+
+## 19. What changed in v1.7.1
+
+- **CVT Probe** in the Console tab (section 18) with a copyable report that is also saved to the Console log.
+- **CVT preset:** long timeout and adaptive timing off while on 7E1, always restored; new (Exp) tiles for 2133, 2102, cubic and J−55; Retry CVT button; Settings → CVT timeout.
+- **Adapter state:** `ATST`, `ATAT` and `ATFC…` typed in the Console now mark the adapter dirty and are undone by Re-run init.
+- Unchanged: the Bluetooth connect / retry logic. v1.7.0 is kept on the GitHub branches `v1.7.0-stable` and `gh-pages-v1.7.0`.
+
+---
+
+## 20. What changed in v1.7.0
 
 - **Service worker:** only the app shell and the small Help page are precached. MANUAL.md, PDFs, GROK_BUILD_BRIEF.md and zips are never cached by the service worker, so updates stay small on mobile data. Help loads the manual on demand when online.
 - **Console safety:** write interlock (Cancel by default) and the adapter-state banner, with automatic re-sync before Live.
@@ -643,4 +699,4 @@ Copy that log if neither formula matches.
 - **Enhanced PIDs:** read-only Mode 21/22 framework with per-PID headers (grouped, only switched when needed, always restored to 7DF) and the experimental Mitsubishi CVT preset.
 - Unchanged: the Bluetooth connect / retry logic (10 attempts, ffea-then-fff1, writeWithoutResponse on FFF2, remembered variant).
 
-*OBD Scanner v1.7.0. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*
+*OBD Scanner v1.7.1. This manual matches the app as published. It is a personal tool, not a substitute for a service manual or a dealer-level scan tool.*

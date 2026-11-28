@@ -1,13 +1,18 @@
-# OBD Scanner (v1.7.0)
+# OBD Scanner (v1.7.1)
 
 A Torque / Car Scanner-style OBD-II app that runs in **Chrome on Android** and talks to a
 **Bluetooth LE ELM327-style dongle** over Web Bluetooth. Plain HTML/JS/CSS with no build step, installable as a PWA.
 
 **User manual and tips:** see [MANUAL.md](MANUAL.md) in this repo, or open **Help** in the app header
 (https://adioi909.github.io/obd-scanner/manual.html). A printable PDF is built as
-`OBD-Scanner-v1.7-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
+`OBD-Scanner-v1.7.1-User-Manual.pdf`. The manual covers every tab, what the app can and cannot change
 on the vehicle (the only UI write is Mode 04 clear codes / reset MIL, which also resets readiness
 monitors), diagnosis tips, Bluetooth troubleshooting, and a reference for the 2013 Mitsubishi test car.
+
+## v1.7.1 CVT probe and CVT timeout
+- **CVT Probe** (Console tab, `js/probe.js`): read-only sequence (AT setup, services 01 and 21) that checks whether the CVT TCM (7E1/7E9) answers with a long timeout, a functional 0100, 2107/2106/2133/2102/2103, a custom flow-control retry and the other module addresses. Shows a summary with candidate temperatures and **Copy probe report** (full raw replies, also saved as a log entry). Always restores `ATSH7DF`, `ATCRA`, `ATH0`, `ATAT1`, `ATST32`, `ATFCSM0` and re-runs init. Max about 60 s, Cancel supported.
+- **CVT preset:** `ATAT0` + `ATSTFF` (setting: CVT timeout) while on 7E1, restored to `ATAT1` + `ATST32`; new (Exp) PIDs 2133, 2102, cubic, J-55; **Retry CVT** clears N/S.
+- `ATST/ATAT/ATFC` count as adapter-mutating in the Console. BLE connect/retry state machine unchanged. Cache `obd-scanner-v1.7.1`. Backup: branches `v1.7.0-stable`, `gh-pages-v1.7.0`.
 
 ## v1.7.0 safety, long drives, background recovery, enhanced PIDs
 - **Service worker hygiene:** precache is the app shell plus `manual.html` only; `.md`, `.pdf`, `.zip` and `GROK_BUILD_BRIEF.md` are never precached or runtime-cached. Cache `obd-scanner-v1.7.0`.
