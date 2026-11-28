@@ -1,7 +1,7 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.7.2';
+  var APP_VERSION = 'v1.7.3';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
@@ -122,7 +122,7 @@
     $('#conn-help').classList.add('hidden');
     state.transport = t;
     t.onDisconnect = function () { onLinkLost(); };
-    state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout });
+    state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout, drainLateMs: 1000 });
     state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse, pidTimeout: settings.timeout, enhancedSt: settings.cvtSt });
     state.connected = true;
     var bleLabel = t.kind === 'mock' ? 'Simulated' : (t.name + ' · ' + (t.profileName || '') + (t.subscribed && t.subscribed.length ? ' · ntf ' + t.subscribed.map(function (c) { return Transport.shortUuid(c.uuid); }).join('+') : ''));
@@ -167,6 +167,8 @@
     var ntf = state.transport.activeNotifyUuid ? (' · RX ' + Transport.shortUuid(state.transport.activeNotifyUuid)) : '';
     setStatus('on', (state.transport.kind === 'mock' ? 'Demo · ' : '') + (state.transport.name || 'Connected') + ntf);
     log('info', 'Init complete' + (state.transport.activeNotifyUuid ? ' (RX on ' + state.transport.activeNotifyUuid + ', ' + (state.transport.writeModeLabel ? state.transport.writeModeLabel() : '') + ')' : ''));
+    state.labBaseline = (typeof LAB !== 'undefined') ? LAB.snapshotAdapter(state.obd) : null;
+    if ($('#lab-revert')) $('#lab-revert').disabled = !state.labBaseline;
     renderTiles();
   }
 
@@ -216,7 +218,7 @@
   };
   $('#btn-reinit').onclick = function () { if (state.connected) initElm(); };
 
-  function requireConn() { if (state.probing) { toast('The CVT probe is running; wait for it to finish'); return false; } if (!state.connected) { toast('Connect the dongle first (or use Demo mode)'); return false; } return true; }
+  function requireConn() { if (state.probing || state.labBusy) { toast('Wait for the current test to finish'); return false; } if (!state.connected) { toast('Connect the dongle first (or use Demo mode)'); return false; } return true; }
 
   // ---------------- Profiles ----------------
   function activeProfile() { return profiles.find(function (p) { return p.id === settings.activeProfile; }) || profiles[0]; }
@@ -679,7 +681,7 @@
     return { app: APP_VERSION, ua: navigator.userAgent, info: { elm: info.elm, protocol: info.protocol, voltage: info.voltage, vin: state.vin } };
   }
   async function runProbe() {
-    if (state.probing) return;
+    if (state.probing || state.labBusy) return;
     if (!requireConn()) return;
     if (state.recording) { toast('Stop recording first'); return; }
     if (state.live) { log('info', 'CVT probe: stopping Live first'); await stopLive(); }
@@ -720,6 +722,111 @@
     }
   };
   window.__runProbe = runProbe; // for tests
+
+  // ---------------- Lab (v1.7.3) ----------------
+  function labSay(text) {
+    var box = $('#lab-out'); if (!box) return;
+    box.textContent = text || '';
+    box.classList.toggle('hidden', !text);
+    state.lastLab = text || '';
+  }
+  function labSnap() { return (typeof LAB !== 'undefined' && state.obd) ? LAB.snapshotAdapter(state.obd) : null; }
+  async function runLab(fn) {
+    if (state.labBusy || state.probing) return;
+    if (!requireConn()) return;
+    if (state.recording) { toast('Stop recording first'); return; }
+    if (state.live) { log('info', 'Lab: stopping Live first'); await stopLive(); }
+    state.labBusy = true;
+    var before = labSnap();
+    state.labBefore = before;
+    $('#lab-revert').disabled = false;
+    setStatus('busy', 'Lab…');
+    try { await fn(before); }
+    catch (e) { log('warn', 'Lab: ' + (e && e.message)); labSay('Lab failed: ' + (e && e.message)); toast('Lab failed: ' + (e && e.message), 5000); }
+    state.labBusy = false;
+    if (state.connected && state.transport) {
+      var ntf = state.transport.activeNotifyUuid ? (' · RX ' + Transport.shortUuid(state.transport.activeNotifyUuid)) : '';
+      setStatus('on', (state.transport.kind === 'mock' ? 'Demo · ' : '') + (state.transport.name || 'Connected') + ntf);
+    }
+  }
+  $('#btn-lab-filter').onclick = function () {
+    runLab(async function (snap) {
+      log('info', 'Lab: receive-filter test (read-only)');
+      var rep = await LAB.filterTest(state.obd, { log: log, snap: snap });
+      labSay(rep.text);
+      toast(rep.filterIgnored ? 'Dongle ignores ATCRA' : (rep.tcm7E9 ? '7E9 answered' : 'Filter test done'), 4000);
+    });
+  };
+  $('#btn-lab-engine').onclick = function () {
+    runLab(async function (snap) {
+      log('info', 'Lab: engine service 21 sweep (read-only)');
+      var rep = await LAB.engineSweep(state.obd, { log: log, snap: snap });
+      labSay(rep.text);
+      toast('Engine sweep done', 3000);
+    });
+  };
+  $('#btn-lab-m8').onclick = function () {
+    runLab(async function (snap) {
+      log('info', 'Lab: Mode 08 supported tests (0800, read-only)');
+      var rep = await LAB.mode08Supported(state.obd, { log: log, snap: snap });
+      labSay(rep.text);
+      var host = $('#lab-m8-tests');
+      host.innerHTML = (rep.names || []).map(function (t) {
+        return '<button class="btn small" data-m8="' + t.tid + '">Run ' + t.tid + '</button>';
+      }).join('');
+      host.querySelectorAll('[data-m8]').forEach(function (b) {
+        b.onclick = function () { runMode8(b.dataset.m8); };
+      });
+      toast(rep.names && rep.names.length ? (rep.names.length + ' on-board test(s)') : 'No Mode 08 tests', 3000);
+    });
+  };
+  async function runMode8(tid) {
+    if (!requireConn()) return;
+    var cls = ELM.classifyCommand('08' + tid);
+    log('warn', 'Lab: 08' + tid + ' can start an on-board test; asking for confirmation');
+    if (!(await confirmWrite(cls))) { log('info', 'Lab: 08' + tid + ' cancelled, nothing sent'); toast('Not sent'); return; }
+    log('warn', 'Lab: user confirmed 08' + tid);
+    await runLab(async function (snap) {
+      var rep = await LAB.mode08Run(state.obd, tid, { log: log, snap: snap });
+      labSay(rep.text);
+    });
+  }
+  $('#btn-lab-snap').onclick = function () {
+    if (!requireConn()) return;
+    state.labBefore = labSnap();
+    $('#lab-revert').disabled = false;
+    var s = state.labBefore;
+    var line = 'Snapshot ' + s.at + '\nHeader ' + (s.header ? s.header.tx + (s.header.rx ? ' / ' + s.header.rx : ' / no filter') : '?') +
+      (s.headerKnown ? '' : ' (unknown)') + '\nTiming ATAT' + (s.timing ? s.timing.at : '?') + ' ATST' + (s.timing ? s.timing.st : '?') +
+      '\nFlow control ' + (s.fc && s.fc.mode === 1 ? 'custom' : 'automatic') +
+      '\nThis is the dongle, not the car. Revert sends those settings back. It does not undelete codes or undo a test that already ran.';
+    labSay(line);
+    log('info', 'Lab snapshot\n' + line);
+    toast('Snapshot saved', 2000);
+  };
+  $('#lab-revert').onclick = function () {
+    runLab(async function () {
+      var snap = state.labBefore || state.labBaseline;
+      log('info', 'Lab: revert dongle to ' + (state.labBefore ? 'the snapshot' : 'connect defaults'));
+      var r = snap ? await LAB.restoreSnapshot(state.obd, snap) : await LAB.restoreDefaults(state.obd);
+      showDirty(false);
+      labSay('Revert (' + r.how + '): ' + (r.ok ? 'ok' : 'INCOMPLETE') + '\n' + (r.lines || []).join('\n') +
+        '\nThe dongle is back to that adapter setup. Cleared codes, a Mode 08 test, and anything typed as Mode 10/11/2E are not undone.');
+      toast(r.ok ? 'Dongle restored' : 'Restore incomplete — re-run init', 4000);
+    });
+  };
+  $('#btn-lab-init').onclick = function () {
+    if (!requireConn()) return;
+    if (state.recording) { toast('Stop recording first'); return; }
+    log('info', 'Lab: full re-init (ATZ and the normal setup)');
+    initElm().then(function () { labSay('Full re-init finished. Adapter defaults are whatever init just set (7DF, no filter, ATAT1, ATST32).'); toast('Init done', 2500); }).catch(function (e) { toast('Init failed: ' + (e && e.message)); });
+  };
+  $('#btn-lab-copy').onclick = async function () {
+    var txt = state.lastLab; if (!txt) return;
+    try { await navigator.clipboard.writeText(txt); toast('Lab result copied'); } catch (e) {
+      var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' })); a.download = 'lab-result.txt'; a.click(); toast('Lab result downloaded');
+    }
+  };
 
   // ---------------- Utils & boot ----------------
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }

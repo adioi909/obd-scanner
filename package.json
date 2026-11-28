@@ -1,7 +1,7 @@
 {
   "name": "obd-scanner",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "private": true,
   "description": "Web Bluetooth OBD-II scanner for BLE ELM327 dongles",
-  "scripts": { "test": "node --test tests/core.test.js tests/ble.test.js tests/v17.test.js tests/v171.test.js tests/v172.test.js", "serve": "python3 -m http.server 8080" }
+  "scripts": { "test": "node --test tests/core.test.js tests/ble.test.js tests/v17.test.js tests/v171.test.js tests/v172.test.js tests/v173.test.js", "serve": "python3 -m http.server 8080" }
 }

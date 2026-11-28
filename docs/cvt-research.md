@@ -3,7 +3,7 @@
 Implemented in the app as v1.7.2 (read-only): live polling uses ATAT0 + ATSTFF, Torque flow control (ATFCSH7E1 / ATFCSD30080A / ATFCSM1, restored with ATFCSM0), a single retry with the receive filter cleared after NO DATA, and ScanGauge 2122 (first data byte minus 55) next to 2133 / 2102 / 2103. The Live "CVT estimate" line ranks decoded candidates against coolant. It does not lock a formula; cold versus warm on the car still decides that. Bluetooth connect logic was not changed.
 
 Context: ATSH7E1 / ATCRA7E9 accepted, then 2103 and 2101 -> NO DATA. Functional 0100 (ATH1, 7DF) shows only 7E8.
-The notes below are the research that v1.7.2 was built from. Nothing in them has been verified on this car yet.
+The notes below are the research that v1.7.2 was built from. The 2026-11-28 probe (engine about 170 °F, 14.9 V) then answered the open question: with headers on and no filter, only 7E8 replied. 7E1 `0100` / `0142` / `2107` / `2106` / `2133` / `2102` / `2122` / `2103` (and `2103` again with ATFCSM1) were adapter NO DATA at about 2.14 s. `7E0 211A` returned `61 1A 42 31 00 00 00` in 184 ms. 7E2–7E7 were silent. Either this TCM does not answer 7E1, or the clone drops every CAN id except 7E8. v1.7.3's Lab filter test separates those. No formula is locked.
 
 ## What the sources say
 
