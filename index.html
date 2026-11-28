@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0d1117">
-<title>OBD Scanner v1.7.0</title>
+<title>OBD Scanner v1.7.1</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="icons/icon.svg">
@@ -12,7 +12,7 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.7.0</small> <a class="help-link" href="manual.html" target="_blank" rel="noopener">Help</a></div>
+  <div class="brand">OBD<span>Scanner</span><small class="ver" id="app-ver">v1.7.1</small> <a class="help-link" href="manual.html" target="_blank" rel="noopener">Help</a></div>
   <div id="status" class="pill off" role="status">Disconnected</div>
 </header>
 <div id="dirty-banner" class="banner hidden" role="alert">
@@ -87,6 +87,7 @@
         <select id="s-notify"><option value="auto">Auto</option><option value="fff1">fff1 only</option><option value="ffea">ffea only</option></select>
       </label>
       <label class="row">Command timeout (ms)<input type="number" id="s-timeout" min="500" max="10000" step="100"></label>
+      <label class="row">CVT / TCM ELM timeout (ATST hex, FF = 1 s)<input type="text" id="s-cvtst" maxlength="2" size="3" class="mono" autocapitalize="characters" autocomplete="off" spellcheck="false"></label>
       <p class="hint">BLE write mode and notify characteristic apply on the next connect. Live automatically falls back from multi-PID to single-PID if a request does not decode, and logs every live request and response. Pull-to-refresh is disabled so it cannot drop the Bluetooth session.</p>
     </div>
   </section>
@@ -96,6 +97,7 @@
     <div class="card tight">
       <div class="live-head">
         <select id="live-profile" class="grow"></select>
+        <button id="btn-retry-cvt" class="btn small hidden" title="Clear the N/S verdicts on the experimental CVT PIDs and try them again">Retry CVT</button>
       </div>
       <div class="btn-row">
         <button id="btn-live" class="btn primary big grow">Start live</button>
@@ -134,6 +136,17 @@
 
   <!-- CONSOLE -->
   <section id="view-console" class="view">
+    <div class="card tight" id="probe-card">
+      <h2>CVT probe <small class="hint">read-only</small></h2>
+      <p class="hint">Asks the transmission module (7E1/7E9) and a few neighbours what they answer, with a long timeout and headers on. Sends only AT setup plus services 01 and 21, takes up to about a minute, then puts the adapter back. Stops Live first; refuses while recording.</p>
+      <div class="btn-row">
+        <button id="btn-probe" class="btn primary grow">Run CVT probe</button>
+        <button id="btn-probe-cancel" class="btn danger hidden">Cancel</button>
+      </div>
+      <div id="probe-progress" class="mono hint hidden"></div>
+      <pre id="probe-summary" class="probe-summary hidden"></pre>
+      <button id="btn-probe-copy" class="btn full hidden">Copy probe report</button>
+    </div>
     <div class="card tight">
       <div class="btn-row">
         <input id="con-input" class="grow mono" placeholder="ATI, 010C, 03 ..." autocapitalize="characters" autocomplete="off" spellcheck="false">
@@ -175,6 +188,7 @@
 <script src="js/pids.js"></script>
 <script src="js/dtc.js"></script>
 <script src="js/transport.js"></script>
+<script src="js/probe.js"></script>
 <script src="js/obd.js"></script>
 <script src="js/storage.js"></script>
 <script src="js/chart.js"></script>
