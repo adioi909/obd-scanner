@@ -1,13 +1,13 @@
 /* UI controller. */
 (function () {
   'use strict';
-  var APP_VERSION = 'v1.7.0';
+  var APP_VERSION = 'v1.7.1';
   var $ = function (s) { return document.querySelector(s); };
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); };
 
   var settings = Store.loadSettings();
   var profiles = Store.loadProfiles();
-  var state = { lastDevice: null, transport: null, session: null, obd: null, connected: false, connecting: null, live: false, recording: null, supported: null, vin: null };
+  var state = { lastDevice: null, transport: null, session: null, obd: null, connected: false, connecting: null, live: false, recording: null, supported: null, vin: null, probing: false, lastProbe: null };
 
   // ---------------- Console log ----------------
   var LOG_MAX = 1500, logLines = [];
@@ -66,18 +66,19 @@
   function bindSettings() {
     $('#s-units').value = settings.units; $('#s-proto').value = settings.protocol;
     $('#s-multi').checked = settings.multiPid; $('#s-fast').checked = settings.fastResponse;
-    $('#s-write').value = settings.writeMode; $('#s-notify').value = settings.notifyChar || 'auto'; $('#s-timeout').value = settings.timeout;
+    $('#s-write').value = settings.writeMode; $('#s-notify').value = settings.notifyChar || 'auto'; $('#s-timeout').value = settings.timeout; $('#s-cvtst').value = settings.cvtSt || 'FF';
     var save = function () {
       settings.units = $('#s-units').value; settings.protocol = $('#s-proto').value;
       settings.multiPid = $('#s-multi').checked; settings.fastResponse = $('#s-fast').checked;
       settings.writeMode = $('#s-write').value; settings.notifyChar = $('#s-notify').value; settings.timeout = Math.max(500, +$('#s-timeout').value || 2500);
+      settings.cvtSt = OBD.normSt($('#s-cvtst').value); $('#s-cvtst').value = settings.cvtSt;
       Store.saveSettings(settings);
       if (state.obd) { state.obd.multiPid = settings.multiPid; state.obd.fastResponse = settings.fastResponse; }
       if (state.session) state.session.opts.timeout = settings.timeout;
-      if (state.obd) state.obd.opts.pidTimeout = settings.timeout;
+      if (state.obd) { state.obd.opts.pidTimeout = settings.timeout; state.obd.enhancedSt = settings.cvtSt; }
       renderTiles();
     };
-    ['#s-units', '#s-proto', '#s-multi', '#s-fast', '#s-write', '#s-notify', '#s-timeout'].forEach(function (id) { $(id).addEventListener('change', save); });
+    ['#s-units', '#s-proto', '#s-multi', '#s-fast', '#s-write', '#s-notify', '#s-timeout', '#s-cvtst'].forEach(function (id) { $(id).addEventListener('change', save); });
   }
 
   // ---------------- Connect ----------------
@@ -122,7 +123,7 @@
     state.transport = t;
     t.onDisconnect = function () { onLinkLost(); };
     state.session = new Transport.ElmSession(t, { log: log, timeout: settings.timeout });
-    state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse, pidTimeout: settings.timeout });
+    state.obd = new OBD.Obd(state.session, { log: log, multiPid: settings.multiPid, fastResponse: settings.fastResponse, pidTimeout: settings.timeout, enhancedSt: settings.cvtSt });
     state.connected = true;
     var bleLabel = t.kind === 'mock' ? 'Simulated' : (t.name + ' · ' + (t.profileName || '') + (t.subscribed && t.subscribed.length ? ' · ntf ' + t.subscribed.map(function (c) { return Transport.shortUuid(c.uuid); }).join('+') : ''));
     $('#i-ble').textContent = bleLabel;
@@ -215,7 +216,7 @@
   };
   $('#btn-reinit').onclick = function () { if (state.connected) initElm(); };
 
-  function requireConn() { if (!state.connected) { toast('Connect the dongle first (or use Demo mode)'); return false; } return true; }
+  function requireConn() { if (state.probing) { toast('The CVT probe is running; wait for it to finish'); return false; } if (!state.connected) { toast('Connect the dongle first (or use Demo mode)'); return false; } return true; }
 
   // ---------------- Profiles ----------------
   function activeProfile() { return profiles.find(function (p) { return p.id === settings.activeProfile; }) || profiles[0]; }
@@ -319,6 +320,7 @@
         '<div class="bar"><i></i></div><div class="mm"><span class="mn">min --</span><span class="mx">max --</span></div></div>';
     }).join('');
     tileStats = {};
+    var rb = $('#btn-retry-cvt'); if (rb) rb.classList.toggle('hidden', !p.pids.some(function (x) { return PIDS.isEnhanced(x); }));
   }
   function markTileNS(pid) {
     var el = document.getElementById('tile-' + pid); if (!el || el.dataset.ns) return;
@@ -339,6 +341,13 @@
       el.querySelector('.bar i').style.width = (isNaN(pct) ? 0 : pct) + '%';
     });
   }
+
+  $('#btn-retry-cvt').onclick = function () {
+    if (!state.obd) { toast('Connect first'); return; }
+    var n = state.obd.clearEnhancedNS();
+    renderTiles();
+    toast(n ? 'Retrying ' + n + ' CVT PID(s)' : 'No CVT PIDs were marked N/S', 2500);
+  };
 
   var wakeLock = null;
   async function keepAwake(on) {
@@ -646,6 +655,56 @@
       var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' })); a.download = 'obd-log.txt'; a.click(); toast('Log downloaded');
     }
   };
+
+
+  // ---------------- CVT probe (v1.7.1) ----------------
+  var probeCtl = null;
+  function probeCtx() {
+    var info = (state.obd && state.obd.info) || {};
+    return { app: APP_VERSION, ua: navigator.userAgent, info: { elm: info.elm, protocol: info.protocol, voltage: info.voltage, vin: state.vin } };
+  }
+  async function runProbe() {
+    if (state.probing) return;
+    if (!requireConn()) return;
+    if (state.recording) { toast('Stop recording first'); return; }
+    if (state.live) { log('info', 'CVT probe: stopping Live first'); await stopLive(); }
+    state.probing = true; probeCtl = { cancelled: false };
+    $('#btn-probe').disabled = true; $('#btn-probe-cancel').classList.remove('hidden');
+    $('#probe-summary').classList.add('hidden'); $('#btn-probe-copy').classList.add('hidden');
+    var pg = $('#probe-progress'); pg.classList.remove('hidden'); pg.textContent = 'Starting…';
+    setStatus('busy', 'CVT probe…');
+    log('info', 'CVT probe started (read-only: AT setup + services 01 and 21; adapter is restored afterwards)');
+    var rep = null;
+    try {
+      rep = await PROBE.run(state.obd, {
+        log: log, version: APP_VERSION, control: probeCtl,
+        onProgress: function (t, pct) { pg.textContent = t + (pct != null ? '  (' + pct + '%)' : ''); },
+        onDirty: function () { showDirty(true, ['CVT probe restore incomplete']); },
+        reinit: async function () { await initElm(); showDirty(false); }
+      });
+    } catch (e) { log('warn', 'CVT probe failed: ' + (e && e.message)); toast('Probe failed: ' + (e && e.message), 5000); }
+    state.probing = false; probeCtl = null;
+    $('#btn-probe').disabled = false; $('#btn-probe-cancel').classList.add('hidden'); pg.classList.add('hidden');
+    if (rep) {
+      var text = PROBE.formatReport(rep, probeCtx());
+      state.lastProbe = text;
+      try { localStorage.setItem('obd.probe.last', text); } catch (e) { /* ignore */ }
+      log('info', 'CVT PROBE REPORT\n' + text);
+      var sum = text.slice(0, text.indexOf('--- Full transcript'));
+      var box = $('#probe-summary'); box.textContent = sum.trim(); box.classList.remove('hidden');
+      $('#btn-probe-copy').classList.remove('hidden');
+      toast(rep.aborted ? 'Probe stopped early: ' + rep.aborted : 'Probe done. Tap Copy probe report.', 4000);
+    }
+  }
+  $('#btn-probe').onclick = runProbe;
+  $('#btn-probe-cancel').onclick = function () { if (probeCtl) { probeCtl.cancelled = true; $('#probe-progress').textContent = 'Cancelling… restoring the adapter'; } };
+  $('#btn-probe-copy').onclick = async function () {
+    var txt = state.lastProbe; if (!txt) return;
+    try { await navigator.clipboard.writeText(txt); toast('Probe report copied'); } catch (e) {
+      var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' })); a.download = 'cvt-probe-report.txt'; a.click(); toast('Probe report downloaded');
+    }
+  };
+  window.__runProbe = runProbe; // for tests
 
   // ---------------- Utils & boot ----------------
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }

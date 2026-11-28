@@ -655,6 +655,8 @@
     this.tcm = this.opts.tcm != null ? this.opts.tcm : true;
     this.txHeader = '7DF'; this.rxFilter = null;
     this.headerLog = []; // every ATSH / ATCRA seen, for tests
+    // v1.7.1: timing / flow-control state and a log of every command, so tests can check what the app sent.
+    this.st = '32'; this.at = 1; this.fcMode = 0; this.cmdLog = [];
   }
   MockTransport.prototype.connect = async function () { this.connected = true; return true; };
   MockTransport.prototype.disconnect = async function () { this.connected = false; this.onDisconnect(); };
@@ -662,6 +664,7 @@
     var self = this;
     var cmd = str.replace(/[\r\n]/g, '').trim().toUpperCase();
     var compact = cmd.replace(/\s+/g, '');
+    this.cmdLog.push(compact);
     var reply = this._respond(compact);
     if (reply == null) return; // hang: no prompt, like a clone that never finishes a multi-PID request
     var body = (this.echo ? cmd + '\r' : '') + reply;
@@ -758,7 +761,15 @@
     var self = this;
     if (c.indexOf('AT') === 0) {
       var a = c.slice(2);
-      if (a === 'Z' || a === 'D') { this.echo = true; this.spaces = true; this.headers = false; this.txHeader = '7DF'; this.rxFilter = null; if (a === 'D') return 'OK'; return '\r\rELM327 v1.5'; }
+      if (a === 'Z' || a === 'D') { this.echo = true; this.spaces = true; this.headers = false; this.txHeader = '7DF'; this.rxFilter = null; this.st = '32'; this.at = 1; this.fcMode = 0; if (a === 'D') return 'OK'; return '\r\rELM327 v1.5'; }
+      var mst = /^ST([0-9A-F]{2})$/.exec(a);
+      if (mst) { this.st = mst[1]; return 'OK'; }
+      if (/^AT[0-2]$/.test(a)) { this.at = +a[2]; return 'OK'; }
+      if (/^FC(SH[0-9A-F]{3}|SD[0-9A-F]{2,}|SM[0-2])$/.test(a)) {
+        if (this.opts.rejectFc) return '?';
+        if (a.indexOf('FCSM') === 0) this.fcMode = +a[4];
+        return 'OK';
+      }
       if (/^SH[0-9A-F]{3}$/.test(a)) { this.txHeader = a.slice(2); this.headerLog.push('ATSH' + this.txHeader); return this.opts.rejectSh ? '?' : 'OK'; }
       if (/^CRA[0-9A-FX]{0,3}$/.test(a)) { this.rxFilter = a.length > 3 ? a.slice(3) : null; this.headerLog.push(a.length > 3 ? 'ATCRA' + this.rxFilter : 'ATCRA'); return this.opts.rejectCra ? '?' : 'OK'; }
       if (a === 'I') return 'ELM327 v1.5';
@@ -782,45 +793,81 @@
     var body = c;
     if (body.length % 2 === 1) body = body.slice(0, -1); // strip "1" response-count suffix
     var mode = body.slice(0, 2), rest = body.slice(2);
+    var tx = this.txHeader, list = [];
     if (mode === '21' || mode === '22') {
-      if (this.txHeader !== '7E1' || mode !== '21' || rest !== '03' || !this.tcm) return 'NO DATA';
-      if (this.tcm === 'hang') return null;
-      // 61 03 + 20 data bytes; data[13] (Torque "N") is the fluid temperature thermistor count
+      if (mode !== '21') return 'NO DATA';
+      if (tx === '7E1') {
+        if (!this.tcm || !this._tcmTiming()) return 'NO DATA';
+        if (this.tcm === 'hang' && rest === '03') return null;
+        var d = this._tcmService(rest);
+        if (!d) return this.opts.tcmNrc ? this._deliver([{ id: '7E9', hex: '7F2112' }]) : 'NO DATA';
+        return this._deliver([{ id: '7E9', hex: '61' + rest + d.map(hx).join('') }]);
+      }
+      if (tx === '7E0' && rest === '1A') return this._deliver([{ id: '7E8', hex: '611A408000' }]);
+      return 'NO DATA';
+    }
+    if (tx === '7DF' || tx === '7E0') {
+      var e = this._engineHex(mode, rest, body);
+      if (e === null) return null; // simulated hang
+      if (e) list.push({ id: '7E8', hex: e });
+    }
+    // v1.7.1: optional J1979 answers from the TCM (functional 7DF or physical 7E1) and from other modules (physical 7E2..7E7)
+    if (mode === '01' && (rest === '00' || rest === '42')) {
+      if (this.opts.tcmJ1979 && (tx === '7DF' || tx === '7E1') && this._tcmTiming()) list.push({ id: '7E9', hex: rest === '00' ? '410098018001' : '4142' + hx2(13800) });
+      var oe = this.opts.otherEcus;
+      if (oe && oe[tx] && rest === '00') list.push({ id: oe[tx], hex: '410080000001' });
+    }
+    if (!list.length) return 'NO DATA';
+    return this._deliver(list);
+  };
+
+  /** v1.7.1: does the simulated TCM hear us with the current ATST / ATAT? (opts.tcmDelayMs models a slow module) */
+  MockTransport.prototype._tcmTiming = function () {
+    var d = this.opts.tcmDelayMs || 0;
+    if (!d) return true;
+    return parseInt(this.st, 16) * 4 >= d && (this.at === 0 || d <= 200);
+  };
+
+  /** Data bytes (after 61 xx) of the simulated TCM, or null if that request is not supported. */
+  MockTransport.prototype._tcmService = function (rest) {
+    var o = this.opts, i, data;
+    if (o.tcmPids && o.tcmPids.indexOf(rest) < 0) return null;
+    if (rest === '03') {
+      // 20 data bytes; data[13] (Torque "N") is the fluid temperature thermistor count
       var sim = this._sim();
       var n = Math.round(Math.min(200, 60 + sim.run * 0.5)); // ~28 C at start, warming
-      if (this.opts.tcmByteN != null) n = this.opts.tcmByteN;
-      var data = [];
-      for (var di = 0; di < 20; di++) data.push(di === 13 ? n : (0x10 + di));
+      if (o.tcmByteN != null) n = o.tcmByteN;
+      data = [];
+      for (i = 0; i < 20; i++) data.push(i === 13 ? n : (0x10 + i));
       if (this.tcm === 'short') data = data.slice(0, 8);
-      var hexs = '6103' + data.map(hx).join('');
-      var bb2 = hexs.match(/../g), ls2 = [hx2(bb2.length).slice(1)], j2 = 6, sq2 = 0;
-      ls2.push('0: ' + self._fmt(bb2.slice(0, 6).join('')));
-      while (j2 < bb2.length) { sq2++; var ch2 = bb2.slice(j2, j2 + 7); while (ch2.length < 7) ch2.push('00'); ls2.push(sq2.toString(16).toUpperCase() + ': ' + self._fmt(ch2.join(''))); j2 += 7; }
-      return ls2.join('\r');
+      return data;
     }
-    if (this.txHeader !== '7DF' && this.txHeader !== '7E0') return 'NO DATA'; // mode 01 etc. only answered by the ECU
+    if (rest === '07') return [0x10, 0x00, 0x00, 0x00, 0x00];
+    if (rest === '06') return [0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+    if (rest === '33') return [o.t33 != null ? o.t33 : 95];
+    if (rest === '02') return [0x20, 0x30, 0x40, 0x50, 0x60, o.t02 != null ? o.t02 : 65, 0x70, 0x80];
+    return null;
+  };
+
+  /** Engine ECU (7E8) reply as a hex string (no PCI), '' for NO DATA, null for a simulated hang. */
+  MockTransport.prototype._engineHex = function (mode, rest, body) {
+    var self = this;
     if (mode === '03' || mode === '07' || mode === '0A') {
       var list = this.dtcs[mode] || [];
-      var resp = hx(parseInt(mode, 16) + 0x40) + hx(list.length) + list.join('');
-      return this._fmt(resp);
+      return hx(parseInt(mode, 16) + 0x40) + hx(list.length) + list.join('');
     }
     if (mode === '04') { this.dtcs = { '03': [], '07': [], '0A': this.dtcs['0A'] }; return '44'; }
     if (mode === '09' && rest === '02') {
       var vin = this.opts.vin || '1HGBH41JXMN109186';
-      var bytes = '490201' + vin.split('').map(function (ch) { return hx(ch.charCodeAt(0)); }).join('');
-      // ISO-TP style multi-frame: 014 + 0:6 bytes, 1..:7 bytes
-      var b = bytes.match(/../g), lines = ['014'], i = 0, seq = 0;
-      lines.push('0: ' + self._fmt(b.slice(0, 6).join(''))); i = 6;
-      while (i < b.length) { seq++; var chunk = b.slice(i, i + 7); while (chunk.length < 7) chunk.push('00'); lines.push(seq.toString(16).toUpperCase() + ': ' + self._fmt(chunk.join(''))); i += 7; }
-      return lines.join('\r');
+      return '490201' + vin.split('').map(function (ch) { return hx(ch.charCodeAt(0)); }).join('');
     }
     if (mode === '01' || mode === '02') {
       var pids = [];
       if (mode === '01') { for (var k = 0; k < rest.length; k += 2) pids.push(rest.substr(k, 2)); }
       else pids.push(rest.substr(0, 2));
       if (mode === '01' && pids.length > 1 && this.opts.multiPidHang) return null;
-      if (mode === '01' && pids.length > 1 && this.opts.multiPidNoData) return 'NO DATA';
-      if (mode === '02' && !this.dtcs['03'].length) return 'NO DATA';
+      if (mode === '01' && pids.length > 1 && this.opts.multiPidNoData) return '';
+      if (mode === '02' && !this.dtcs['03'].length) return '';
       var out = hx(parseInt(mode, 16) + 0x40);
       var any = false;
       pids.forEach(function (p) {
@@ -835,16 +882,40 @@
         else data = self._pidData(p);
         if (data != null) { out += p + (mode === '02' ? '00' : '') + data; any = true; }
       });
-      if (!any) return 'NO DATA';
-      if (out.length / 2 > 7) {
-        var bb = out.match(/../g), ls = [hx2(bb.length).slice(1)], j = 6, sq = 0;
-        ls.push('0: ' + self._fmt(bb.slice(0, 6).join('')));
-        while (j < bb.length) { sq++; var ch = bb.slice(j, j + 7); while (ch.length < 7) ch.push('00'); ls.push(sq.toString(16).toUpperCase() + ': ' + self._fmt(ch.join(''))); j += 7; }
-        return ls.join('\r');
-      }
-      return this._fmt(out);
+      return any ? out : '';
     }
-    return 'NO DATA';
+    return '';
+  };
+
+  /** Format replies from one or more simulated modules, honouring ATH and ATCRA. */
+  MockTransport.prototype._deliver = function (list) {
+    var self = this, out = [];
+    list.forEach(function (r) {
+      if (self.rxFilter && self.rxFilter !== r.id) return; // ATCRA filter
+      out.push(self.headers ? self._framesH1(r.id, r.hex) : self._fmtH0(r.hex));
+    });
+    return out.length ? out.join('\r') : 'NO DATA';
+  };
+
+  /** Headers off: single line, or the ELM "014 / 0: / 1:" multi-line layout above 7 bytes. */
+  MockTransport.prototype._fmtH0 = function (hex) {
+    var bb = hex.match(/../g) || [];
+    if (bb.length <= 7) return this._fmt(hex);
+    var ls = [hx2(bb.length).slice(1)], j = 6, sq = 0;
+    ls.push('0: ' + this._fmt(bb.slice(0, 6).join('')));
+    while (j < bb.length) { sq++; var ch = bb.slice(j, j + 7); while (ch.length < 7) ch.push('00'); ls.push(sq.toString(16).toUpperCase() + ': ' + this._fmt(ch.join(''))); j += 7; }
+    return ls.join('\r');
+  };
+
+  /** Headers on (ATH1): raw CAN frames, "7E8 06 41 00 .." single frame, or "7E9 10 LL .." first frame + "7E9 2n .." consecutive frames. */
+  MockTransport.prototype._framesH1 = function (id, hex) {
+    var self = this, bb = hex.match(/../g) || [], lines = [];
+    function line(bytes) { return id + (self.spaces ? ' ' : '') + self._fmt(bytes.join('')); }
+    if (bb.length <= 7) return line([hx(bb.length)].concat(bb));
+    lines.push(line(['1' + hx2(bb.length).slice(1, 2), hx2(bb.length).slice(2)].concat(bb.slice(0, 6))));
+    var j = 6, sq = 0;
+    while (j < bb.length) { sq = (sq + 1) & 15; var ch = bb.slice(j, j + 7); while (ch.length < 7) ch.push('00'); lines.push(line(['2' + sq.toString(16).toUpperCase()].concat(ch))); j += 7; }
+    return lines.join('\r');
   };
 
   // ---------------- Serialized command queue ----------------

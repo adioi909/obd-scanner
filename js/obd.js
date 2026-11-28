@@ -25,6 +25,16 @@
     this.enhancedMaxFails = this.opts.enhancedMaxFails || 3;
     this.enhancedEveryMs = this.opts.enhancedEveryMs != null ? this.opts.enhancedEveryMs : 2000; // temps change slowly
     this._enhancedLast = 0;
+    // v1.7.1: ELM timeout used while talking to the TCM (hex byte, units of 4 ms; FF = about 1 s) with adaptive timing off.
+    this.enhancedSt = normSt(this.opts.enhancedSt);
+  }
+
+  /** Normalise a user-supplied ATST value to two hex digits (20..FF); anything else becomes FF. */
+  function normSt(v) {
+    var h = String(v == null ? 'FF' : v).replace(/[^0-9A-Fa-f]/g, '').toUpperCase();
+    var n = parseInt(h, 16);
+    if (!h || isNaN(n) || n < 0x20) return 'FF';
+    return (n > 255 ? 'FF' : (n < 16 ? '0' : '') + n.toString(16).toUpperCase());
   }
 
   Obd.prototype.cmd = function (c, t) { return this.s.send(c, t); };
@@ -122,7 +132,9 @@
     var st = this.adapter, self = this;
     var full = st.dirtyCmds.some(function (c) { return /^AT(Z|WS|D$|D[01]$|SP|TP)/.test(c); });
     var cmds = ['ATE0', 'ATL0', 'ATS0', 'ATH0', 'ATAL', 'ATCAF1'];
+    var timing = st.dirtyCmds.some(function (c) { return /^AT(AT|ST|FC)/.test(c); });
     if (full) cmds.push('ATAT1', 'ATSP' + (this.protocol || '0'));
+    else if (timing) cmds.push('ATAT' + ELM.DEFAULT_TIMING.at, 'ATST' + ELM.DEFAULT_TIMING.st, 'ATFCSM0'); // v1.7.1: a manual ATST / ATAT / ATFC* from the Console
     cmds.push('ATSH' + ELM.DEFAULT_HEADER.tx, 'ATCRA');
     this.log('warn', 'Adapter state was changed from the Console (' + st.dirtyCmds.join(', ') + '); re-syncing ' + cmds.join(' ') + ' before polling');
     var ok = true;
@@ -166,16 +178,60 @@
     return ok;
   };
 
-  /** Make sure the standard broadcast header (ATSH 7DF, no ATCRA filter) is active. */
-  Obd.prototype.restoreDefaultHeader = async function () {
-    if (this.adapter.headerKnown && ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER)) return true;
-    var ok = await this.setHeader(ELM.DEFAULT_HEADER);
-    if (!ok) {
-      // One more try: a stale prompt or a busy bus can eat the first command.
-      ok = await this.setHeader(ELM.DEFAULT_HEADER);
+  /**
+   * v1.7.1: set the ELM response timeout (ATST hh) and adaptive timing (ATAT0/1/2) only if they differ from what the adapter is
+   * known to use. A '?' reply is tolerated (some clones ignore these); the app still tracks the intended state.
+   */
+  Obd.prototype.setTiming = async function (target) {
+    var st = this.adapter, cur = st.timingKnown ? st.timing : null;
+    var cmds = [];
+    if (!cur || cur.at !== target.at) cmds.push('ATAT' + target.at);
+    if (!cur || cur.st !== target.st) cmds.push('ATST' + target.st);
+    for (var i = 0; i < cmds.length; i++) {
+      var r = '';
+      try { r = await this.cmd(cmds[i], 2000); }
+      catch (e) {
+        if (e.message === 'CANCELLED' || e.fatal) throw e;
+        st.timingKnown = false;
+        this.log('warn', 'Timing command ' + cmds[i] + ' failed: ' + e.message);
+        return false;
+      }
+      if (ELM.detectError(r, cmds[i]) === '?') this.log('warn', 'Adapter rejected ' + cmds[i] + ' (continuing)');
     }
-    if (ok) this.log('info', 'Header restored to ' + ELM.DEFAULT_HEADER.tx + ' (receive filter cleared)');
+    st.timing = { st: target.st, at: target.at }; st.timingKnown = true;
+    return true;
+  };
+
+  Obd.prototype.restoreDefaultTiming = async function () {
+    var d = ELM.DEFAULT_TIMING, t = this.adapter.timing;
+    if (this.adapter.timingKnown && t && t.st === d.st && t.at === d.at) return true;
+    var ok = await this.setTiming({ st: d.st, at: d.at });
+    if (!ok) ok = await this.setTiming({ st: d.st, at: d.at });
+    if (ok) this.log('info', 'Timing restored to ATST' + d.st + ' / ATAT' + d.at);
     return ok;
+  };
+
+  /** Make sure the standard broadcast header (ATSH 7DF, no ATCRA filter) and normal timing (ATST32, ATAT1) are active. */
+  Obd.prototype.restoreDefaultHeader = async function () {
+    var ok = true;
+    if (!(this.adapter.headerKnown && ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER))) {
+      ok = await this.setHeader(ELM.DEFAULT_HEADER);
+      if (!ok) {
+        // One more try: a stale prompt or a busy bus can eat the first command.
+        ok = await this.setHeader(ELM.DEFAULT_HEADER);
+      }
+      if (ok) this.log('info', 'Header restored to ' + ELM.DEFAULT_HEADER.tx + ' (receive filter cleared)');
+    }
+    var tOk = await this.restoreDefaultTiming();
+    return ok && tOk;
+  };
+
+  /** v1.7.1: forget the 3-failure N/S verdicts so enhanced PIDs are tried again ("Retry CVT"). */
+  Obd.prototype.clearEnhancedNS = function () {
+    var n = Object.keys(this.enhancedNS).length;
+    this.enhancedNS = {}; this.enhancedFails = {}; this._enhancedLast = 0;
+    this.log('info', 'Retry CVT: cleared ' + n + ' N/S verdict(s); enhanced PIDs will be tried again');
+    return n;
   };
 
   /** Query supported PIDs 0100/0120/0140/... -> array of PID hex strings. */
@@ -282,7 +338,8 @@
     (pids || []).forEach(function (p) { (PIDS.isEnhanced(p) ? enh : std).push(p); });
     var out = {};
     if (std.length) {
-      if (!this.adapter.headerKnown || !ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER)) await this.restoreDefaultHeader();
+      var tm = this.adapter.timing, tmOk = this.adapter.timingKnown && tm && tm.st === ELM.DEFAULT_TIMING.st && tm.at === ELM.DEFAULT_TIMING.at;
+      if (!this.adapter.headerKnown || !ELM.sameHeader(this.adapter.header, ELM.DEFAULT_HEADER) || !tmOk) await this.restoreDefaultHeader();
       out = await this._queryStandard(std);
     }
     var self = this;
@@ -317,10 +374,15 @@
         g.reqOrder.forEach(function (rq) { self._enhancedFailed(g.header, rq, g.reqs[rq], 'header switch rejected'); });
         continue;
       }
+      // v1.7.1: long ELM timeout + adaptive timing off while this group talks to a slow module (the TCM); restored with the header.
+      var slow = g.reqOrder.some(function (rq0) { return g.reqs[rq0].some(function (p0) { return PIDS.get(p0).slowTimeout; }); });
+      var wantT = slow ? { st: this.enhancedSt, at: 0 } : { st: ELM.DEFAULT_TIMING.st, at: ELM.DEFAULT_TIMING.at };
+      await this.setTiming(wantT);
+      var reqTimeout = Math.max(this._pidTimeout(), 1500, slow ? parseInt(this.enhancedSt, 16) * 4 + 1200 : 0);
       for (var ri = 0; ri < g.reqOrder.length; ri++) {
         var rq = g.reqOrder[ri], members = g.reqs[rq];
         var r = '', errName = null;
-        try { r = await this.cmd(rq, Math.max(this._pidTimeout(), 1500)); }
+        try { r = await this.cmd(rq, reqTimeout); }
         catch (e) {
           if (e.message === 'CANCELLED' || e.fatal) throw e;
           errName = e.message; r = e.partial || '';
@@ -358,7 +420,7 @@
     if (n >= this.enhancedMaxFails) {
       var self = this;
       members.forEach(function (p) { self.enhancedNS[p] = true; });
-      this.log('warn', 'Enhanced request ' + header.tx + ' ' + rq + ' failed ' + n + ' times in a row (' + why + '); marking ' + members.join(', ') + ' as N/S and skipping it. Re-run init to retry.');
+      this.log('warn', 'Enhanced request ' + header.tx + ' ' + rq + ' failed ' + n + ' times in a row (' + why + '); marking ' + members.join(', ') + ' as N/S and skipping it. Tap Retry CVT (Live tab) or re-run init to try again.');
     }
   };
 
@@ -442,6 +504,6 @@
   };
   function require_dtc() { return DTC; }
 
-  var api = { Obd: Obd, PROTOCOLS: PROTOCOLS };
+  var api = { Obd: Obd, PROTOCOLS: PROTOCOLS, normSt: normSt };
   if (isNode) module.exports = api; else root.OBD = api;
 })(this);
