@@ -162,14 +162,18 @@
   // ---------------- v1.7.0: adapter state tracking ----------------
   /** Standard OBD broadcast header (CAN 11-bit functional address) and "no receive filter". */
   var DEFAULT_HEADER = { tx: '7DF', rx: null };
+  /** v1.7.1: default ELM timing after ATZ: ATST 32 (about 200 ms) and adaptive timing 1 (ATAT1). */
+  var DEFAULT_TIMING = { st: '32', at: 1 };
 
   /** Mutable record of what the app believes the adapter is configured as. */
   function createAdapterState() {
-    return { dirty: false, dirtyCmds: [], header: { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }, headerKnown: true };
+    return { dirty: false, dirtyCmds: [], header: { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }, headerKnown: true,
+      timing: { st: DEFAULT_TIMING.st, at: DEFAULT_TIMING.at }, timingKnown: true };
   }
   /** Back to the state right after a successful init (ATZ ... ATSPx leaves the default 7DF header, no CRA filter). */
   function resetAdapterState(st) {
     st.dirty = false; st.dirtyCmds = []; st.header = { tx: DEFAULT_HEADER.tx, rx: DEFAULT_HEADER.rx }; st.headerKnown = true;
+    st.timing = { st: DEFAULT_TIMING.st, at: DEFAULT_TIMING.at }; st.timingKnown = true;
     return st;
   }
 
@@ -177,7 +181,7 @@
 
   // AT commands that change how the adapter formats replies or which bus/module it talks to.
   // ATDP / ATDPN (read protocol) and ATI / ATRV are read-only and deliberately NOT matched.
-  var AT_MUTATING = /^AT(Z|WS|D|D[01]|E[01]?|H[01]?|S[01]|SPA?[0-9A-C]?|TP[0-9A-C]?|SH[0-9A-F]*|CAF[01]?|CRA[0-9A-FX]*)$/;
+  var AT_MUTATING = /^AT(Z|WS|D|D[01]|E[01]?|H[01]?|S[01]|SPA?[0-9A-C]?|TP[0-9A-C]?|SH[0-9A-F]*|CAF[01]?|CRA[0-9A-FX]*|AT[0-2]|ST[0-9A-F]{1,2}|FC(SM[0-2]|SH[0-9A-F]*|SD[0-9A-F]*))$/;
 
   // First byte of an OBD / UDS request that can write, reset or unlock something.
   var WRITE_SERVICES = {
@@ -214,6 +218,7 @@
     st.dirty = true;
     if (st.dirtyCmds.indexOf(c) < 0) st.dirtyCmds.push(c);
     if (/^AT(Z|D|D[01]|WS|SH|CRA|SP|TP)/.test(c)) st.headerKnown = false; // header / filter no longer known
+    if (/^AT(Z|D|D[01]|WS|AT|ST|FC)/.test(c)) st.timingKnown = false; // ATST / ATAT / flow control (v1.7.1)
     return st;
   }
 
@@ -268,6 +273,7 @@
     parseVin: parseVin,
     toHex: toHex,
     DEFAULT_HEADER: DEFAULT_HEADER,
+    DEFAULT_TIMING: DEFAULT_TIMING,
     WRITE_SERVICES: WRITE_SERVICES,
     createAdapterState: createAdapterState,
     resetAdapterState: resetAdapterState,

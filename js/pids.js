@@ -97,7 +97,15 @@
   function cvtPoly(N) {
     return 0.000000002344 * Math.pow(N, 5) - 0.000001387 * Math.pow(N, 4) + 0.0003193 * Math.pow(N, 3) - 0.03501 * N * N + 2.302 * N - 36.6;
   }
-  var CVT_REQ = { mode: '21', request: '2103', txHeader: '7E1', rxFilter: '7E9', minBytes: 14 };
+  /** "CVT temp 2" cubic from the elm3.ru / out-club Outlander CSV (same byte N as the polynomial). */
+  function cvtCubic(N) { return 0.0000286 * N * N * N - 0.00951 * N * N + 1.46 * N - 30.1; }
+  // slowTimeout: while polling the TCM the app uses a long ELM timeout (ATSTFF, adaptive timing off) and restores ATST32 / ATAT1 afterwards.
+  var CVT_REQ = { mode: '21', request: '2103', txHeader: '7E1', rxFilter: '7E9', minBytes: 14, slowTimeout: true };
+  // v1.7.1 research candidates (see docs/cvt-research.md): other 7E1 service-21 reads that may carry a fluid temperature.
+  //   2133: first data byte A, A-50 (Pelican/OBDb Lancer 2015, single short frame). 2102: 6th data byte (Torque letter F), F-40 (Pelican Lancer 2015/2019; Pajero 21 02 -40).
+  //   2103 byte J (10th data byte), J-55 (Pelican "AT ATF temp"; same as the Out3 3.0 "AT Temp" J-55).
+  var CVT33_REQ = { mode: '21', request: '2133', txHeader: '7E1', rxFilter: '7E9', minBytes: 1, slowTimeout: true };
+  var CVT02_REQ = { mode: '21', request: '2102', txHeader: '7E1', rxFilter: '7E9', minBytes: 6, slowTimeout: true };
   var ENHANCED = [
     Object.assign({ pid: 'MCVT', name: 'CVT fluid temperature (Exp)', short: 'CVT temp (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -40, max: 150,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'polynomial on N (JF011E)',
@@ -105,6 +113,18 @@
     Object.assign({ pid: 'MCVT8', name: 'CVT temp alt N-55 (Exp, JF016E formula)', short: 'CVT N-55 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -55, max: 200,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'N - 55 (CVT8)',
       decode: function (d) { return d.length > 13 ? d[13] - 55 : null; } }, CVT_REQ),
+    Object.assign({ pid: 'MCVT33', name: 'CVT temp 2133 A-50 (Exp)', short: 'CVT 2133 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -50, max: 205,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 0, formula: 'A - 50 (request 2133)',
+      decode: function (d) { return d.length > 0 ? d[0] - 50 : null; } }, CVT33_REQ),
+    Object.assign({ pid: 'MCVT02', name: 'CVT temp 2102 F-40 (Exp)', short: 'CVT 2102 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -40, max: 215,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 5, formula: 'F - 40 (request 2102)',
+      decode: function (d) { return d.length > 5 ? d[5] - 40 : null; } }, CVT02_REQ),
+    Object.assign({ pid: 'MCVTJ', name: 'CVT temp 2103 J-55 (Exp, OBDb)', short: 'CVT J-55 (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -55, max: 200,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 9, formula: 'J - 55 (request 2103)',
+      decode: function (d) { return d.length > 9 ? d[9] - 55 : null; } }, Object.assign({}, CVT_REQ, { minBytes: 10 })),
+    Object.assign({ pid: 'MCVT3', name: 'CVT temp 2103 cubic N (Exp, "CVT temp 2")', short: 'CVT cubic (Exp)', bytes: 0, unit: '°C', kind: 'temp', min: -50, max: 250,
+      cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'cubic on N (CVT temp 2)',
+      decode: function (d) { return d.length > 13 ? cvtCubic(d[13]) : null; } }, CVT_REQ),
     Object.assign({ pid: 'MCVTN', name: 'CVT temp raw byte N (Exp)', short: 'CVT raw N (Exp)', bytes: 0, unit: '', kind: 'none', min: 0, max: 255,
       cat: 'Mitsubishi CVT (Exp)', enhanced: true, experimental: true, byteIndex: 13, formula: 'raw N',
       decode: function (d) { return d.length > 13 ? d[13] : null; } }, CVT_REQ)
@@ -190,9 +210,13 @@
     { id: 'preset-air', name: 'Air intake', pids: ['10', '0B', '0F', '33', '11', '0C', '04'] },
     { id: 'preset-cat', name: 'O2 / Catalyst', pids: ['14', '15', '18', '19', '3C', '3E', '06', '07', '0C'] },
     { id: 'preset-elec', name: 'Charging / electrical', pids: ['42', '0C', '04', '05'] },
-    { id: 'preset-mitsu-cvt', name: 'Mitsubishi CVT (Experimental)', pids: ['MCVT', 'MCVT8', 'MCVTN', '05', '0C'], experimental: true }
+    { id: 'preset-mitsu-cvt', name: 'Mitsubishi CVT (Experimental)', pids: ['MCVT33', 'MCVT02', 'MCVT', 'MCVT8', 'MCVT3', 'MCVTJ', 'MCVTN', '05', '0C'], experimental: true }
+  ];
+  // v1.7.1: when a stored preset still has exactly the old default list, replace it with the new one (edited presets are never touched).
+  var PRESET_UPGRADES = [
+    { id: 'preset-mitsu-cvt', from: ['MCVT', 'MCVT8', 'MCVTN', '05', '0C'], to: PRESETS.filter(function (p) { return p.id === 'preset-mitsu-cvt'; })[0].pids.slice() }
   ];
 
-  var api = { DEFS: DEFS, ENHANCED: ENHANCED, ALL: DEFS.concat(ENHANCED), CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, isEnhanced: isEnhanced, isSupported: isSupported, code: code, decodeEnhanced: decodeEnhanced, cvtPoly: cvtPoly, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
+  var api = { DEFS: DEFS, ENHANCED: ENHANCED, ALL: DEFS.concat(ENHANCED), CATEGORIES: CATEGORIES, PRESETS: PRESETS, get: get, isEnhanced: isEnhanced, isSupported: isSupported, code: code, decodeEnhanced: decodeEnhanced, cvtPoly: cvtPoly, cvtCubic: cvtCubic, PRESET_UPGRADES: PRESET_UPGRADES, length: length, decode: decode, toDisplay: toDisplay, pollList: pollList, unitFor: unitFor, format: format };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.PIDS = api;
 })(this);

@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   var LS_SETTINGS = 'obd.settings.v1', LS_PROFILES = 'obd.profiles.v1';
-  var DEFAULT_SETTINGS = { units: 'imperial', protocol: '0', multiPid: true, fastResponse: true, writeMode: 'auto', notifyChar: 'auto', timeout: 2500, activeProfile: 'preset-quick' };
+  var DEFAULT_SETTINGS = { units: 'imperial', protocol: '0', multiPid: true, fastResponse: true, writeMode: 'auto', notifyChar: 'auto', timeout: 2500, cvtSt: 'FF', activeProfile: 'preset-quick' };
 
   function loadSettings() {
     try { return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem(LS_SETTINGS) || '{}')); } catch (e) { return Object.assign({}, DEFAULT_SETTINGS); }
@@ -23,6 +23,11 @@
     var added = false;
     root.PIDS.PRESETS.forEach(function (pr) {
       if (seen.indexOf(pr.id) < 0 && !list.some(function (x) { return x.id === pr.id; })) { list.push(JSON.parse(JSON.stringify(pr))); added = true; }
+    });
+    // v1.7.1: refresh a stored preset that still has exactly the old default PID list.
+    (root.PIDS.PRESET_UPGRADES || []).forEach(function (u) {
+      var pr = list.find(function (x) { return x.id === u.id; });
+      if (pr && JSON.stringify(pr.pids) === JSON.stringify(u.from)) { pr.pids = u.to.slice(); added = true; }
     });
     if (added) saveProfiles(list);
     localStorage.setItem(LS_PRESETS_SEEN, JSON.stringify(all));
